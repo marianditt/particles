@@ -1,6 +1,8 @@
 import logging
 from time import time
 
+logger = logging.getLogger(__name__)
+
 
 class FpsTimer(object):
     MIN_TIME_TO_NEXT_FRAME = 1e-9
@@ -15,7 +17,7 @@ class FpsTimer(object):
         if remaining >= self.MIN_TIME_TO_NEXT_FRAME:
             return remaining
         else:
-            logging.warning(f"Frame is lagging {abs(remaining):.2f}s behind.")
+            logger.warning(f"Frame is lagging {abs(remaining):.2f}s behind.")
             return self.MIN_TIME_TO_NEXT_FRAME
 
     def reset(self) -> None:

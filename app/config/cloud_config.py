@@ -2,9 +2,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class ParticleConfig(object):
+class CloudConfig(object):
     num_particles: int
-    num_rays: int
+    num_repetitions: int
     particle_radius: float
-    min_distance: float
-    max_iterations: int

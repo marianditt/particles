@@ -8,7 +8,7 @@ Point = Tuple[float, float]
 
 
 class Viewer(object):
-    def __init__(self, fps: int = 30) -> None:
+    def __init__(self, fps: float = 30) -> None:
         self.__fps_timer = FpsTimer(fps)
         self.__figure: plt.Figure = plt.figure()
         self.__axes: plt.Axes = self.__figure.gca()
