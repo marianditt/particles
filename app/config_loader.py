@@ -7,6 +7,7 @@ from app.config.objective_config import ObjectiveConfig
 from app.config.state_factory_config import StateFactoryConfig
 from optimization.gradient_descent import GradientDescentConfig
 from optimization.monte_carlo_optimization import MonteCarloOptimizationConfig
+from optimization.optimization_algorithm import State
 from optimization.particle_swarm_optimization import ParticleSwarmOptimizationConfig
 from optimization.simulated_annealing import SimulatedAnnealingConfig
 
@@ -14,11 +15,11 @@ from optimization.simulated_annealing import SimulatedAnnealingConfig
 class ConfigLoader(object):
     @staticmethod
     def load_config(*args: str) -> ApplicationConfig:
-        num_rays = 16
+        num_rays = 4
 
         cloud = CloudConfig(
-            num_particles=5,
-            num_repetitions=8,
+            num_particles=7,
+            num_instances=7,
             particle_radius=1.0
         )
 
@@ -27,8 +28,9 @@ class ConfigLoader(object):
         )
 
         state_factory = StateFactoryConfig(
-            std_spread=10.0,
-            max_period=500.0,
+            std_spread_x=8.0,
+            std_spread_y=10.0,
+            max_period=20.0,
             cloud=cloud,
             light=light
         )
@@ -42,26 +44,28 @@ class ConfigLoader(object):
         gradient_descent = GradientDescentConfig(
             initial_step_size=0.01,
             grow_factor=1.5,
-            shrink_factor=0.5
+            shrink_factor=0.5,
+            min_step_size=1e-20
         )
 
         monte_carlo_optimization = MonteCarloOptimizationConfig(
-            num_iterations_per_step=100,
-            ranges=[math.pi / num_rays]
+            num_iterations_per_step=10,
+            ranges=State([math.pi / num_rays])
         )
 
         particle_swarm_optimization = ParticleSwarmOptimizationConfig(
             num_particles=100,
-            std_initial_velocity=0.1,
+            std_initial_velocity=0.001,
             momentum=0.8,
-            perception=1.5,
-            social=0.2
+            perception=0.4,
+            social=0.4,
+            max_velocity=0.1
         )
 
         simulated_annealing = SimulatedAnnealingConfig(
-            std_step_size=0.5,
-            num_iterations=int(1e6),
-            max_temperature=1e8,
+            std_step_size=0.1,
+            num_iterations=int(1000),
+            max_temperature=10,
         )
 
         return ApplicationConfig(

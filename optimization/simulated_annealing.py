@@ -1,11 +1,10 @@
 import math
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable
 
-from optimization.optimization_algorithm import OptimizationAlgorithm
+from optimization.optimization_algorithm import OptimizationAlgorithm, State
 from optimization.state_factory import StateFactory
 
-State = List[float]
 Objective = Callable[[State], float]
 NeighborProvider = Callable[[State], State]
 TemperatureProvider = Callable[[int], float]
@@ -77,7 +76,7 @@ class SimulatedAnnealing(OptimizationAlgorithm):
 
 def create_default_neighbor_provider(std_step_size: float) -> NeighborProvider:
     from random import gauss
-    return lambda state: [gauss(value, std_step_size) for value in state]
+    return lambda state: State(gauss(value, std_step_size) for value in state)
 
 
 def create_default_temperature_provider(num_iterations: int, max_temperature: float) -> TemperatureProvider:

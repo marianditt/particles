@@ -13,11 +13,11 @@ class ParticleService:
         self.__config = config
 
     def cloud(self) -> Cloud:
-        stream = Stream(self.__cloud_algorithm.best_state())
+        stream = Stream(self.__cloud_algorithm.best_state().to_array())
         return Cloud.from_stream(stream, self.__config.cloud)
 
     def light(self) -> Light:
-        stream = Stream(self.__light_algorithm.best_state())
+        stream = Stream(self.__light_algorithm.best_state().to_array())
         return Light.from_stream(stream, self.__config.light)
 
     def reset(self) -> None:

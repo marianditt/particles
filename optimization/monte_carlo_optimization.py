@@ -16,7 +16,7 @@ class MonteCarloOptimization(OptimizationAlgorithm):
         self.__objective = objective
         self.__state_factory = state_factory
         self.__config = config
-        self.__best_state: State = []
+        self.__best_state = State([])
         self.reset()
 
     def reset(self) -> None:
@@ -27,7 +27,7 @@ class MonteCarloOptimization(OptimizationAlgorithm):
         best_energy = self.__objective(self.__best_state)
 
         for _ in range(self.__config.num_iterations_per_step):
-            next_state = [s + r * (2 * random() - 1) for s, r in zip(self.__best_state, self.__config.ranges)]
+            next_state = State(s + r * (2 * random() - 1) for s, r in zip(self.__best_state, self.__config.ranges))
             next_energy = self.__objective(next_state)
             if next_energy < best_energy:
                 self.__best_state = next_state

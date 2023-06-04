@@ -13,6 +13,7 @@ class GradientDescentConfig(object):
     initial_step_size: float
     grow_factor: float
     shrink_factor: float
+    min_step_size: float
 
 
 class GradientDescent(OptimizationAlgorithm):
@@ -23,7 +24,7 @@ class GradientDescent(OptimizationAlgorithm):
         self.__state_factory = state_factory
         self.__config = config
 
-        self.__state = []
+        self.__state = State([])
         self.__step_size = 0.0
         self.reset()
 
@@ -34,8 +35,8 @@ class GradientDescent(OptimizationAlgorithm):
     def step(self) -> None:
         current_value = self.__objective(self.__state)
         step = self.__gradient(self.__state)
-        while True:
-            next_state = [s - self.__step_size * ds for s, ds in zip(self.__state, step)]
+        while self.__step_size >= self.__config.min_step_size:
+            next_state = self.__state - self.__step_size * step
             next_value = self.__objective(next_state)
             if next_value < current_value:
                 self.__state = next_state

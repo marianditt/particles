@@ -9,4 +9,4 @@ class LightStateFactory(StateFactory):
 
     def create_state(self) -> State:
         from app.model.light import Light
-        return Light(0.0, self.__config.light).to_array()
+        return State(Light(0.0, self.__config.light).to_array())
