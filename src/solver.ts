@@ -29,6 +29,7 @@ interface Node {
   hi: Float64Array;
   vol: number;
   ub: number;
+  depth: number;
 }
 
 function gauss(): number {
@@ -45,6 +46,9 @@ export class Solver {
   readonly n: number;
   private readonly dims: number;
   private readonly dirs: Float64Array; // cos, sin pairs
+  private readonly levels: number; // depth at which all directions are in use
+  private critI = 0;
+  private critJ = 1;
   private readonly stack: Node[] = [];
   private readonly xlo: Float64Array;
   private readonly xhi: Float64Array;
@@ -79,6 +83,7 @@ export class Solver {
       this.dirs[2 * k] = Math.cos(phi);
       this.dirs[2 * k + 1] = Math.sin(phi);
     }
+    this.levels = Math.max(0, Math.ceil(Math.log2(count) - 1e-9));
     this.xlo = new Float64Array(n);
     this.xhi = new Float64Array(n);
     this.ylo = new Float64Array(n);
@@ -100,7 +105,7 @@ export class Solver {
         lo[2 + 2 * (i - 2)] = i === 2 ? 0 : -r;
         hi[2 + 2 * (i - 2)] = r;
       }
-      this.stack.push({ lo, hi, vol: 1, ub: Infinity });
+      this.stack.push({ lo, hi, vol: 1, ub: Infinity, depth: 0 });
       // Incumbent: particles on a line with spacing 2 is always feasible.
       const line = new Float64Array(2 * n);
       for (let i = 0; i < n; i++) line[2 * i] = 2 * i;
@@ -143,7 +148,12 @@ export class Solver {
       for (let j = i + 1; j < n; j++) {
         const dx = Math.max(Math.abs(xhi[i] - xlo[j]), Math.abs(xhi[j] - xlo[i]));
         const dy = Math.max(Math.abs(yhi[i] - ylo[j]), Math.abs(yhi[j] - ylo[i]));
-        s = Math.min(s, Math.hypot(dx, dy));
+        const h = Math.hypot(dx, dy);
+        if (h < s) {
+          s = h;
+          this.critI = i;
+          this.critJ = j;
+        }
       }
     return s;
   }
@@ -162,9 +172,11 @@ export class Solver {
   }
 
   /** False if the boxes (needs unpackBox) provably contain no feasible configuration. */
-  private mayBeFeasible(): boolean {
+  private mayBeFeasible(depth = Infinity): boolean {
     const { xlo, xhi, ylo, yhi, n, idx, ilo, ihi, dirs } = this;
-    for (let d = 0; d < dirs.length; d += 2) {
+    // Coarse direction subsets (stride 2^k) high in the tree; all directions from depth `levels` on.
+    const stride = 1 << Math.max(0, this.levels - depth);
+    for (let d = 0; d < dirs.length; d += 2 * stride) {
       const c = dirs[d];
       const s = dirs[d + 1];
       const ac = Math.abs(c);
@@ -354,6 +366,32 @@ export class Solver {
     return true;
   }
 
+  /**
+   * Branching variable: the coordinate of the critical pair (the one that determines the upper bound)
+   * with the largest contribution dx^2 or dy^2 to that bound. Needs unpackBox and upperBound.
+   */
+  private branchDim(node: Node, fallback: number): number {
+    const { xlo, xhi, ylo, yhi, critI: i, critJ: j } = this;
+    const dx = Math.max(Math.abs(xhi[i] - xlo[j]), Math.abs(xhi[j] - xlo[i]));
+    const dy = Math.max(Math.abs(yhi[i] - ylo[j]), Math.abs(yhi[j] - ylo[i]));
+    const dimOf = (p: number, axis: number) => (p === 0 || (p === 1 && axis === 1) ? -1 : p === 1 ? 0 : 1 + 2 * (p - 2) + axis);
+    for (const axis of dx >= dy ? [0, 1] : [1, 0]) {
+      let bestD = -1;
+      let bestW = MIN_WIDTH;
+      for (const p of [i, j]) {
+        const d = dimOf(p, axis);
+        if (d < 0) continue;
+        const dw = node.hi[d] - node.lo[d];
+        if (dw > bestW) {
+          bestW = dw;
+          bestD = d;
+        }
+      }
+      if (bestD >= 0) return bestD;
+    }
+    return fallback;
+  }
+
   get finished(): boolean {
     return this.stack.length === 0 && this.current === null;
   }
@@ -372,7 +410,7 @@ export class Solver {
         this.cObj++;
         continue;
       }
-      if (!this.mayBeFeasible()) {
+      if (!this.mayBeFeasible(node.depth)) {
         this.pFeas += node.vol;
         this.cFeas++;
         continue;
@@ -405,10 +443,13 @@ export class Solver {
         this.cConv++;
         continue;
       }
+      this.unpackBox(node.lo, node.hi);
+      this.upperBound();
+      widest = this.branchDim(node, widest);
       const mid = (node.lo[widest] + node.hi[widest]) / 2;
-      const a: Node = { lo: node.lo, hi: node.hi.slice(), vol: node.vol / 2, ub };
+      const a: Node = { lo: node.lo, hi: node.hi.slice(), vol: node.vol / 2, ub, depth: node.depth + 1 };
       a.hi[widest] = mid;
-      const b: Node = { lo: node.lo.slice(), hi: node.hi, vol: node.vol / 2, ub };
+      const b: Node = { lo: node.lo.slice(), hi: node.hi, vol: node.vol / 2, ub, depth: node.depth + 1 };
       b.lo[widest] = mid;
       // Explore the half containing the better midpoint-ish region first: use ub of each half.
       this.unpackBox(a.lo, a.hi);
