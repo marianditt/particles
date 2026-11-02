@@ -69,9 +69,6 @@ export class Solver {
   private cConv = 0;
   private improvements = 0;
   private current: Node | null = null;
-  private saPos: Float64Array | null = null;
-  private saObj = -Infinity;
-  private saIter = 0;
 
   constructor(n: number, resolutionDeg: number) {
     this.n = n;
@@ -202,6 +199,7 @@ export class Solver {
   private seed(samples: number) {
     const n = this.n;
     const r = 2 * (n - 1);
+    const initialBest = this.best;
     const pos = new Float64Array(2 * n);
     for (let k = 0; k < samples; k++) {
       const span = Math.random() * r;
@@ -221,6 +219,7 @@ export class Solver {
         this.bestPos = cand;
       }
     }
+    if (this.best > initialBest) this.localSearch();
   }
 
   /** Largest gap between adjacent projections over all sampled directions. */
@@ -260,6 +259,7 @@ export class Solver {
     this.best = obj;
     this.bestPos = pos;
     this.improvements++;
+    this.localSearch();
   }
 
   /**
@@ -267,24 +267,21 @@ export class Solver {
    * towards the feasibility boundary (exponent w < 1) and violations are barely penalised; w and the penalty
    * grow during the cycle and the last STRICT fraction is fully rescaled, so the walker settles on a valid cloud.
    */
-  private localSearch(iters: number) {
+  private localSearch(iters = 50) {
     const n = this.n;
     if (n < 3) return;
-    const CYCLE = 4000;
+    const CYCLE = iters;
     const STRICT = 0.9;
+    let saPos = this.bestPos.slice();
+    let saObj = this.best;
     for (let it = 0; it < iters; it++) {
-      if (!this.saPos || this.saIter >= CYCLE) {
-        this.saPos = this.bestPos.slice();
-        this.saObj = this.best;
-        this.saIter = 0;
-      }
-      const frac = this.saIter++ / CYCLE;
+      const frac = it / CYCLE;
       const temp = 0.02 * Math.pow(1e-3, frac) * Math.max(this.best, 1e-3);
       const step = 0.3 * Math.pow(0.03, frac);
       const strictness = Math.min(1, frac / STRICT);
       const w = strictness * strictness;
       const mu = 5 * w;
-      const cand = this.saPos.slice();
+      const cand = saPos.slice();
       const moves = 1 + Math.floor(Math.random() * 2);
       for (let m = 0; m < moves; m++) {
         const i = 1 + Math.floor(Math.random() * (n - 1));
@@ -301,9 +298,9 @@ export class Solver {
       g *= t;
       const obj = this.pointObjective(cand);
       const score = obj - mu * Math.max(0, g - 2);
-      if (score >= this.saObj || Math.random() < Math.exp((score - this.saObj) / temp)) {
-        this.saPos = cand;
-        this.saObj = score;
+      if (score >= saObj || Math.random() < Math.exp((score - saObj) / temp)) {
+        saPos = cand;
+        saObj = score;
         if (obj > this.best + 1e-12 && g <= 2 + FEAS_TOL) {
           this.best = obj;
           this.bestPos = cand;
@@ -409,7 +406,6 @@ export class Solver {
   /** Process up to maxNodes nodes. */
   step(maxNodes: number): void {
     if (this.start === 0) this.start = performance.now();
-    this.localSearch(50);
     for (let it = 0; it < maxNodes && this.stack.length > 0; it++) {
       const node = this.stack.pop()!;
       this.nodes++;
