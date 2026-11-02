@@ -262,11 +262,16 @@ export class Solver {
     this.improvements++;
   }
 
-  /** Simulated annealing over feasible configurations; moves are rescaled onto the feasibility boundary. */
+  /**
+   * Simulated annealing with a soft feasibility push. Early on, moves are large and only partially rescaled
+   * towards the feasibility boundary (exponent w < 1) and violations are barely penalised; w and the penalty
+   * grow during the cycle and the last STRICT fraction is fully rescaled, so the walker settles on a valid cloud.
+   */
   private localSearch(iters: number) {
     const n = this.n;
     if (n < 3) return;
     const CYCLE = 4000;
+    const STRICT = 0.9;
     for (let it = 0; it < iters; it++) {
       if (!this.saPos || this.saIter >= CYCLE) {
         this.saPos = this.bestPos.slice();
@@ -276,6 +281,9 @@ export class Solver {
       const frac = this.saIter++ / CYCLE;
       const temp = 0.02 * Math.pow(1e-3, frac) * Math.max(this.best, 1e-3);
       const step = 0.3 * Math.pow(0.03, frac);
+      const strictness = Math.min(1, frac / STRICT);
+      const w = strictness * strictness;
+      const mu = 5 * w;
       const cand = this.saPos.slice();
       const moves = 1 + Math.floor(Math.random() * 2);
       for (let m = 0; m < moves; m++) {
@@ -286,15 +294,17 @@ export class Solver {
       cand[3] = 0;
       cand[2] = Math.abs(cand[2]);
       cand[5] = Math.abs(cand[5]);
-      const g = this.maxGap(cand);
+      let g = this.maxGap(cand);
       if (!(g > 0)) continue;
-      const t = 2 / g;
+      const t = Math.pow(2 / g, w);
       for (let k = 0; k < cand.length; k++) cand[k] *= t;
+      g *= t;
       const obj = this.pointObjective(cand);
-      if (obj >= this.saObj || Math.random() < Math.exp((obj - this.saObj) / temp)) {
+      const score = obj - mu * Math.max(0, g - 2);
+      if (score >= this.saObj || Math.random() < Math.exp((score - this.saObj) / temp)) {
         this.saPos = cand;
-        this.saObj = obj;
-        if (obj > this.best + 1e-12 && this.maxGap(cand) <= 2 + FEAS_TOL) {
+        this.saObj = score;
+        if (obj > this.best + 1e-12 && g <= 2 + FEAS_TOL) {
           this.best = obj;
           this.bestPos = cand;
           this.improvements++;
