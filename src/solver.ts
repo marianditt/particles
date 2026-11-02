@@ -37,7 +37,7 @@ function gauss(): number {
 }
 
 /**
- * Branch and bound for N unit-radius particles maximising the minimum pairwise distance min_{i<j} d_ij
+ * Branch and bound for N unit-radius particles maximising the area of the convex hull of their centres
  * subject to: for every sampled direction, adjacent projected centres are at most 2 apart.
  * Symmetry breaking: p0 = (0,0), p1 = (x,0) with x>0, p2 has y>=0.
  * Variables: x1, then (x_i, y_i) for i>=2.
@@ -47,8 +47,11 @@ export class Solver {
   private readonly dims: number;
   private readonly dirs: Float64Array; // cos, sin pairs
   private readonly levels: number; // depth at which all directions are in use
-  private critI = 0;
-  private critJ = 1;
+  private readonly cx: Float64Array;
+  private readonly cy: Float64Array;
+  private readonly order: Int32Array;
+  private readonly hullIdx: Int32Array;
+  private hullCount = 0;
   private readonly stack: Node[] = [];
   private readonly xlo: Float64Array;
   private readonly xhi: Float64Array;
@@ -89,6 +92,10 @@ export class Solver {
     this.ilo = new Float64Array(n);
     this.ihi = new Float64Array(n);
     this.bestPos = new Float64Array(2 * n);
+    this.cx = new Float64Array(4 * n);
+    this.cy = new Float64Array(4 * n);
+    this.order = new Int32Array(4 * n);
+    this.hullIdx = new Int32Array(8 * n + 2);
 
     if (n >= 2) {
       const r = 2 * (n - 1);
@@ -103,7 +110,7 @@ export class Solver {
         hi[2 + 2 * (i - 2)] = r;
       }
       this.stack.push({ lo, hi, vol: 1, ub: Infinity, depth: 0 });
-      // Incumbent: particles on a line with spacing 2 is always feasible.
+      // Incumbent: particles on a line with spacing 2 is always feasible (hull area 0).
       const line = new Float64Array(2 * n);
       for (let i = 0; i < n; i++) line[2 * i] = 2 * i;
       this.best = this.pointObjective(line);
@@ -129,43 +136,57 @@ export class Solver {
     }
   }
 
+  /**
+   * Area of the convex hull of m points (px, py); fills hullOwner with the point indices on the hull.
+   * Monotone chain; px/py are read through `order`, which is sorted in place.
+   */
+  private hullArea(px: Float64Array, py: Float64Array, m: number): number {
+    const order = this.order;
+    const h = this.hullIdx;
+    const o = order.subarray(0, m);
+    for (let k = 0; k < m; k++) o[k] = k;
+    o.sort((a, b) => px[a] - px[b] || py[a] - py[b]);
+    const cross = (a: number, b: number, c: number) =>
+      (px[b] - px[a]) * (py[c] - py[a]) - (py[b] - py[a]) * (px[c] - px[a]);
+    let k = 0;
+    for (let t = 0; t < m; t++) {
+      while (k >= 2 && cross(h[k - 2], h[k - 1], o[t]) <= 0) k--;
+      h[k++] = o[t];
+    }
+    for (let t = m - 2, lower = k + 1; t >= 0; t--) {
+      while (k >= lower && cross(h[k - 2], h[k - 1], o[t]) <= 0) k--;
+      h[k++] = o[t];
+    }
+    this.hullCount = Math.max(0, k - 1);
+    let area = 0;
+    for (let t = 0; t < this.hullCount; t++) {
+      const a = h[t];
+      const b = h[(t + 1) % this.hullCount];
+      area += px[a] * py[b] - px[b] * py[a];
+    }
+    return Math.abs(area) / 2;
+  }
+
   private pointObjective(pos: Float64Array): number {
-    let s = Infinity;
-    for (let i = 0; i < this.n; i++)
-      for (let j = i + 1; j < this.n; j++)
-        s = Math.min(s, Math.hypot(pos[2 * i] - pos[2 * j], pos[2 * i + 1] - pos[2 * j + 1]));
-    return s;
+    const n = this.n;
+    const px = this.cx;
+    const py = this.cy;
+    for (let i = 0; i < n; i++) {
+      px[i] = pos[2 * i];
+      py[i] = pos[2 * i + 1];
+    }
+    return this.hullArea(px, py, n);
   }
 
-  /** Upper bound of the min distance using max distances between boxes (needs unpackBox). */
+  /** Upper bound of the hull area: hull of all box corners (needs unpackBox). Records the hull's boxes. */
   private upperBound(): number {
-    const { xlo, xhi, ylo, yhi, n } = this;
-    let s = Infinity;
+    const { xlo, xhi, ylo, yhi, n, cx, cy } = this;
     for (let i = 0; i < n; i++)
-      for (let j = i + 1; j < n; j++) {
-        const dx = Math.max(Math.abs(xhi[i] - xlo[j]), Math.abs(xhi[j] - xlo[i]));
-        const dy = Math.max(Math.abs(yhi[i] - ylo[j]), Math.abs(yhi[j] - ylo[i]));
-        const h = Math.hypot(dx, dy);
-        if (h < s) {
-          s = h;
-          this.critI = i;
-          this.critJ = j;
-        }
+      for (let c = 0; c < 4; c++) {
+        cx[4 * i + c] = c & 1 ? xhi[i] : xlo[i];
+        cy[4 * i + c] = c & 2 ? yhi[i] : ylo[i];
       }
-    return s;
-  }
-
-  /** Lower bound of the min distance (0 if boxes overlap). */
-  lowerBound(): number {
-    const { xlo, xhi, ylo, yhi, n } = this;
-    let s = Infinity;
-    for (let i = 0; i < n; i++)
-      for (let j = i + 1; j < n; j++) {
-        const dx = Math.max(0, xlo[i] - xhi[j], xlo[j] - xhi[i]);
-        const dy = Math.max(0, ylo[i] - yhi[j], ylo[j] - yhi[i]);
-        s = Math.min(s, Math.hypot(dx, dy));
-      }
-    return s;
+    return this.hullArea(cx, cy, 4 * n);
   }
 
   /** False if the boxes (needs unpackBox) provably contain no feasible configuration. */
@@ -297,7 +318,7 @@ export class Solver {
       for (let k = 0; k < cand.length; k++) cand[k] *= t;
       g *= t;
       const obj = this.pointObjective(cand);
-      const score = obj - mu * Math.max(0, g - 2);
+      const score = obj - mu * (this.best + 1) * Math.max(0, g - 2);
       if (score >= saObj || Math.random() < Math.exp((score - saObj) / temp)) {
         saPos = cand;
         saObj = score;
@@ -311,81 +332,16 @@ export class Solver {
   }
 
   /**
-   * Interval constraint propagation for "all pairwise distances >= d" (needs unpackBox).
-   * Shrinks the boxes in place; returns false if the box provably has no such configuration.
-   */
-  private contract(d: number): boolean {
-    const { xlo, xhi, ylo, yhi, n } = this;
-    for (let pass = 0; pass < 3; pass++) {
-      let changed = false;
-      for (let i = 0; i < n; i++)
-        for (let j = i + 1; j < n; j++) {
-          for (let axis = 0; axis < 2; axis++) {
-            const [alo, ahi, blo, bhi] = axis === 0 ? [xlo, xhi, ylo, yhi] : [ylo, yhi, xlo, xhi];
-            const maxOther = Math.max(Math.abs(blo[i] - bhi[j]), Math.abs(bhi[i] - blo[j]));
-            if (maxOther >= d) continue;
-            const a = Math.sqrt(d * d - maxOther * maxOther);
-            let l = alo[i] - ahi[j];
-            let h = ahi[i] - alo[j];
-            if (l > -a && l < a) l = a;
-            else if (h < a && h > -a) h = -a;
-            else continue;
-            if (l > h) return false;
-            const nilo = Math.max(alo[i], alo[j] + l);
-            const nihi = Math.min(ahi[i], ahi[j] + h);
-            const njlo = Math.max(alo[j], alo[i] - h);
-            const njhi = Math.min(ahi[j], ahi[i] - l);
-            if (nilo > nihi || njlo > njhi) return false;
-            if (nilo > alo[i] || nihi < ahi[i] || njlo > alo[j] || njhi < ahi[j]) changed = true;
-            alo[i] = nilo;
-            ahi[i] = nihi;
-            alo[j] = njlo;
-            ahi[j] = njhi;
-          }
-        }
-      if (!changed) break;
-    }
-    return true;
-  }
-
-  private boxVolume(node: Node): number {
-    let v = 1;
-    for (let d = 0; d < this.dims; d++) v *= node.hi[d] - node.lo[d];
-    return v;
-  }
-
-  /** Copy the (contracted) unpacked boxes back into the node; arrays are cloned as siblings share them. */
-  private repack(node: Node): boolean {
-    const { xlo, xhi, ylo, yhi, n } = this;
-    const lo = new Float64Array(this.dims);
-    const hi = new Float64Array(this.dims);
-    lo[0] = Math.max(node.lo[0], xlo[1]);
-    hi[0] = Math.min(node.hi[0], xhi[1]);
-    for (let i = 2; i < n; i++) {
-      const k = 1 + 2 * (i - 2);
-      lo[k] = xlo[i];
-      hi[k] = xhi[i];
-      lo[k + 1] = ylo[i];
-      hi[k + 1] = yhi[i];
-    }
-    node.lo = lo;
-    node.hi = hi;
-    return true;
-  }
-
-  /**
-   * Branching variable: the coordinate of the critical pair (the one that determines the upper bound)
-   * with the largest contribution dx^2 or dy^2 to that bound. Needs unpackBox and upperBound.
+   * Branching variable: the widest coordinate among the boxes that contribute corners to the bound hull
+   * (needs unpackBox and upperBound); only these boxes can change the bound.
    */
   private branchDim(node: Node, fallback: number): number {
-    const { xlo, xhi, ylo, yhi, critI: i, critJ: j } = this;
-    const dx = Math.max(Math.abs(xhi[i] - xlo[j]), Math.abs(xhi[j] - xlo[i]));
-    const dy = Math.max(Math.abs(yhi[i] - ylo[j]), Math.abs(yhi[j] - ylo[i]));
     const dimOf = (p: number, axis: number) => (p === 0 || (p === 1 && axis === 1) ? -1 : p === 1 ? 0 : 1 + 2 * (p - 2) + axis);
-    for (const axis of dx >= dy ? [0, 1] : [1, 0]) {
-      let bestD = -1;
-      let bestW = MIN_WIDTH;
-      for (const p of [i, j]) {
+    let bestD = -1;
+    let bestW = MIN_WIDTH;
+    for (let t = 0; t < this.hullCount; t++) {
+      const p = this.hullIdx[t] >> 2;
+      for (let axis = 0; axis < 2; axis++) {
         const d = dimOf(p, axis);
         if (d < 0) continue;
         const dw = node.hi[d] - node.lo[d];
@@ -394,9 +350,8 @@ export class Solver {
           bestD = d;
         }
       }
-      if (bestD >= 0) return bestD;
     }
-    return fallback;
+    return bestD >= 0 ? bestD : fallback;
   }
 
   get finished(): boolean {
@@ -420,19 +375,6 @@ export class Solver {
         this.pFeas += node.vol;
         this.cFeas++;
         continue;
-      }
-      // Contract the box against "min distance > best"; the removed volume counts as pruned by objective.
-      const before = this.boxVolume(node);
-      if (!this.contract(this.best + PRUNE_TOL)) {
-        this.pObj += node.vol;
-        this.cObj++;
-        continue;
-      }
-      if (this.repack(node)) {
-        const after = this.boxVolume(node);
-        const kept = before > 0 ? Math.min(1, after / before) : 1;
-        this.pObj += node.vol * (1 - kept);
-        node.vol *= kept;
       }
       this.tryMidpoint(node.lo, node.hi);
       let widest = 0;

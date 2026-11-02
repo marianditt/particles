@@ -12,15 +12,15 @@ describe('solver', () => {
   it('N=1 is trivially done', () => {
     expect(solve(1, 5).status).toBe('done');
   });
-  it('N=2 places particles at distance 2', () => {
+  it('N=2 has hull area 0', () => {
     const s = solve(2, 5);
     expect(s.status).toBe('done');
-    expect(s.positions[2]).toBeCloseTo(2, 6);
+    expect(s.best).toBeCloseTo(0, 6);
   });
   it('N=3 is at least the line configuration and is feasible', () => {
     const s = solve(3, 10);
     expect(s.status).toBe('done');
-    expect(s.best).toBeGreaterThanOrEqual(2 - 1e-9);
+    expect(s.best).toBeGreaterThan(0);
     expect(isFeasible(s.positions, 10)).toBe(true);
   });
   it('reports consistent fractions', () => {
