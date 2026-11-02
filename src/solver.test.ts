@@ -17,10 +17,10 @@ describe('solver', () => {
     expect(s.status).toBe('done');
     expect(s.positions[2]).toBeCloseTo(2, 6);
   });
-  it('N=3 beats the line configuration and is feasible', () => {
+  it('N=3 is at least the line configuration and is feasible', () => {
     const s = solve(3, 10);
     expect(s.status).toBe('done');
-    expect(s.best).toBeGreaterThanOrEqual(Math.log(2) * 2 + Math.log(4) - 1e-9);
+    expect(s.best).toBeGreaterThanOrEqual(2 - 1e-9);
     expect(isFeasible(s.positions, 10)).toBe(true);
   });
   it('reports consistent fractions', () => {

@@ -83,14 +83,14 @@ function draw() {
   const tx = (x: number) => ox + x * scale;
   const ty = (y: number) => oy - y * scale;
   // axes
-  ctx.strokeStyle = '#ddd';
+  ctx.strokeStyle = '#232a36';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(0, ty(0)); ctx.lineTo(w, ty(0));
   ctx.moveTo(tx(0), 0); ctx.lineTo(tx(0), h);
   ctx.stroke();
-  ctx.strokeStyle = '#1565c0';
-  ctx.fillStyle = 'rgba(21,101,192,0.15)';
+  ctx.strokeStyle = '#5eb0ff';
+  ctx.fillStyle = 'rgba(94,176,255,0.12)';
   ctx.lineWidth = 2;
   for (let i = 0; i < n; i++) {
     ctx.beginPath();
@@ -98,7 +98,7 @@ function draw() {
     ctx.fill();
     ctx.stroke();
   }
-  ctx.fillStyle = '#000';
+  ctx.fillStyle = '#e6edf7';
   for (let i = 0; i < n; i++) {
     ctx.beginPath();
     ctx.arc(tx(p[2 * i]), ty(p[2 * i + 1]), 2, 0, 2 * Math.PI);
@@ -116,7 +116,7 @@ function renderStats(s: Stats) {
     ['Status', status],
     ['Elapsed', fmtTime(s.elapsedMs)],
     ['Nodes processed', `${s.nodes} (${Math.round(s.nodes / Math.max(s.elapsedMs / 1000, 1e-3))}/s)`],
-    ['Best objective', s.best.toFixed(6)],
+    ['Best min. distance', s.best.toFixed(6)],
     ['Global upper bound', s.globalUpper.toFixed(6)],
     ['Gap (upper bound − best)', s.gap.toExponential(3)],
     ['Incumbent improvements', String(s.improvements)],
@@ -127,7 +127,7 @@ function renderStats(s: Stats) {
     ['Open regions', String(s.stackSize)],
     ['Likelihood a better solution exists (heuristic)', pct(s.betterLikelihood)],
   ];
-  statsEl.innerHTML = `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>`;
+  statsEl.innerHTML = `${rows.map(([k, v]) => `<div class="stat"><span>${k}</span><b>${v}</b></div>`).join('')}`;
 }
 
 draw();

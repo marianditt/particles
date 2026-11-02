@@ -1,6 +1,6 @@
 export const EPS = 1e-9;
 const FEAS_TOL = 1e-9;
-const PRUNE_TOL = 1e-7;
+const PRUNE_TOL = 1e-4;
 const MIN_WIDTH = 1e-4;
 
 export interface Stats {
@@ -32,7 +32,7 @@ interface Node {
 }
 
 /**
- * Branch and bound for N unit-radius particles maximising sum_{i<j} ln(EPS + d_ij)
+ * Branch and bound for N unit-radius particles maximising the minimum pairwise distance min_{i<j} d_ij
  * subject to: for every sampled direction, adjacent projected centres are at most 2 apart.
  * Symmetry breaking: p0 = (0,0), p1 = (x,0) with x>0, p2 has y>=0.
  * Variables: x1, then (x_i, y_i) for i>=2.
@@ -99,6 +99,7 @@ export class Solver {
       for (let i = 0; i < n; i++) line[2 * i] = 2 * i;
       this.best = this.pointObjective(line);
       this.bestPos = line;
+      this.seed(2000);
     } else {
       this.best = 0;
     }
@@ -120,35 +121,35 @@ export class Solver {
   }
 
   private pointObjective(pos: Float64Array): number {
-    let s = 0;
+    let s = Infinity;
     for (let i = 0; i < this.n; i++)
       for (let j = i + 1; j < this.n; j++)
-        s += Math.log(EPS + Math.hypot(pos[2 * i] - pos[2 * j], pos[2 * i + 1] - pos[2 * j + 1]));
+        s = Math.min(s, Math.hypot(pos[2 * i] - pos[2 * j], pos[2 * i + 1] - pos[2 * j + 1]));
     return s;
   }
 
-  /** Upper bound of the objective using max distances between boxes (needs unpackBox). */
+  /** Upper bound of the min distance using max distances between boxes (needs unpackBox). */
   private upperBound(): number {
     const { xlo, xhi, ylo, yhi, n } = this;
-    let s = 0;
+    let s = Infinity;
     for (let i = 0; i < n; i++)
       for (let j = i + 1; j < n; j++) {
         const dx = Math.max(Math.abs(xhi[i] - xlo[j]), Math.abs(xhi[j] - xlo[i]));
         const dy = Math.max(Math.abs(yhi[i] - ylo[j]), Math.abs(yhi[j] - ylo[i]));
-        s += Math.log(EPS + Math.hypot(dx, dy));
+        s = Math.min(s, Math.hypot(dx, dy));
       }
     return s;
   }
 
-  /** Lower bound of the objective (minimum distances; 0 if boxes overlap). */
+  /** Lower bound of the min distance (0 if boxes overlap). */
   lowerBound(): number {
     const { xlo, xhi, ylo, yhi, n } = this;
-    let s = 0;
+    let s = Infinity;
     for (let i = 0; i < n; i++)
       for (let j = i + 1; j < n; j++) {
         const dx = Math.max(0, xlo[i] - xhi[j], xlo[j] - xhi[i]);
         const dy = Math.max(0, ylo[i] - yhi[j], ylo[j] - yhi[i]);
-        s += Math.log(EPS + Math.hypot(dx, dy));
+        s = Math.min(s, Math.hypot(dx, dy));
       }
     return s;
   }
@@ -178,6 +179,43 @@ export class Solver {
     return true;
   }
 
+  /** Random multi-start incumbents, rescaled onto the feasibility boundary. */
+  private seed(samples: number) {
+    const n = this.n;
+    const r = 2 * (n - 1);
+    const pos = new Float64Array(2 * n);
+    for (let k = 0; k < samples; k++) {
+      const span = Math.random() * r;
+      for (let i = 1; i < n; i++) {
+        pos[2 * i] = (Math.random() * 2 - 1) * span;
+        pos[2 * i + 1] = (Math.random() * 2 - 1) * span;
+      }
+      pos[3] = 0;
+      pos[2] = Math.abs(pos[2]);
+      pos[5] = Math.abs(pos[5]);
+      const g = this.maxGap(pos);
+      if (!(g > 0)) continue;
+      const cand = pos.map((v) => (v * 2) / g);
+      const obj = this.pointObjective(cand);
+      if (obj > this.best && this.maxGap(cand) <= 2 + FEAS_TOL) {
+        this.best = obj;
+        this.bestPos = cand;
+      }
+    }
+  }
+
+  /** Largest gap between adjacent projections over all sampled directions. */
+  private maxGap(pos: Float64Array): number {
+    const { n, dirs, ilo } = this;
+    let g = 0;
+    for (let d = 0; d < dirs.length; d += 2) {
+      for (let i = 0; i < n; i++) ilo[i] = dirs[d] * pos[2 * i] + dirs[d + 1] * pos[2 * i + 1];
+      const sorted = Array.from(ilo).sort((a, b) => a - b);
+      for (let i = 1; i < n; i++) g = Math.max(g, sorted[i] - sorted[i - 1]);
+    }
+    return g;
+  }
+
   /** Evaluate the box midpoint as a candidate solution. */
   private tryMidpoint(lo: Float64Array, hi: Float64Array) {
     const n = this.n;
@@ -188,8 +226,13 @@ export class Solver {
       pos[2 * i] = (lo[k] + hi[k]) / 2;
       pos[2 * i + 1] = (lo[k + 1] + hi[k + 1]) / 2;
     }
+    // Projected gaps scale linearly, so rescale the point to the feasibility boundary.
+    const g = this.maxGap(pos);
+    if (!(g > 0)) return;
+    const t = 2 / g;
+    for (let k = 0; k < pos.length; k++) pos[k] *= t;
     const obj = this.pointObjective(pos);
-    if (obj <= this.best) return;
+    if (obj <= this.best + 1e-12) return;
     for (let i = 0; i < n; i++) {
       this.xlo[i] = this.xhi[i] = pos[2 * i];
       this.ylo[i] = this.yhi[i] = pos[2 * i + 1];
