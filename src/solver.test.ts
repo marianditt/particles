@@ -25,6 +25,9 @@ describe('solver', () => {
   });
   it('reports consistent fractions', () => {
     const s = solve(3, 10);
-    expect(s.exploredFraction).toBeCloseTo(1, 6);
+    const classifiedFraction = s.prunedObjective + s.prunedFeasibility + s.converged;
+    expect(s.exploredFraction).toBeCloseTo(classifiedFraction, 6);
+    expect(s.exploredFraction).toBeGreaterThanOrEqual(0);
+    expect(s.exploredFraction).toBeLessThanOrEqual(1);
   });
 });
