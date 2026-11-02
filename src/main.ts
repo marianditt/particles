@@ -107,27 +107,28 @@ function draw() {
 }
 window.addEventListener('resize', draw);
 
-const pct = (v: number) => `${(v * 100).toFixed(v > 0 && v < 1e-4 ? 8 : 4)} %`;
-const fmtTime = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+const pct = (v: number) => (v > 0 && v < 1e-3 ? '<0.1%' : `${(v * 100).toFixed(1)}%`);
+const fmtTime = (ms: number) => `${(ms / 1000).toFixed(0)}s`;
+const fmtCount = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(0)}k` : String(n));
 
 function renderStats(s: Stats) {
-  const status = { running: 'running', done: 'finished (search space exhausted)', timeout: 'stopped (time threshold)' }[s.status];
+  const status = { running: 'running', done: 'done', timeout: 'timeout' }[s.status];
   const rows: [string, string][] = [
     ['Status', status],
-    ['Elapsed', fmtTime(s.elapsedMs)],
-    ['Nodes processed', `${s.nodes} (${Math.round(s.nodes / Math.max(s.elapsedMs / 1000, 1e-3))}/s)`],
-    ['Best min. distance', s.best.toFixed(6)],
-    ['Global upper bound', s.globalUpper.toFixed(6)],
-    ['Gap (upper bound − best)', s.gap.toExponential(3)],
-    ['Incumbent improvements', String(s.improvements)],
-    ['Explored solution space', `<progress max="1" value="${s.exploredFraction}"></progress> ${pct(s.exploredFraction)}`],
-    ['Pruned by objective bound', `${pct(s.prunedObjective)} (${s.prunedObjectiveCount} regions)`],
-    ['Pruned by feasibility bound', `${pct(s.prunedFeasibility)} (${s.prunedFeasibilityCount} regions)`],
-    ['Converged (region below min. size)', `${pct(s.converged)} (${s.convergedCount} regions)`],
-    ['Open regions', String(s.stackSize)],
-    ['Likelihood a better solution exists (heuristic)', pct(s.betterLikelihood)],
+    ['Time', fmtTime(s.elapsedMs)],
+    ['Nodes', `${fmtCount(s.nodes)} (${fmtCount(Math.round(s.nodes / Math.max(s.elapsedMs / 1000, 1e-3)))}/s)`],
+    ['Best', s.best.toFixed(3)],
+    ['Upper', s.globalUpper.toFixed(3)],
+    ['Gap', s.gap.toExponential(1)],
+    ['Improv.', String(s.improvements)],
+    ['Explored', `<progress max="1" value="${s.exploredFraction}"></progress> ${pct(s.exploredFraction)}`],
+    ['Pruned obj.', `${pct(s.prunedObjective)} (${fmtCount(s.prunedObjectiveCount)})`],
+    ['Pruned feas.', `${pct(s.prunedFeasibility)} (${fmtCount(s.prunedFeasibilityCount)})`],
+    ['Converged', `${pct(s.converged)} (${fmtCount(s.convergedCount)})`],
+    ['Open', fmtCount(s.stackSize)],
+    ['P(better)', pct(s.betterLikelihood)],
   ];
-  statsEl.innerHTML = `${rows.map(([k, v]) => `<div class="stat"><span>${k}</span><b>${v}</b></div>`).join('')}`;
+  statsEl.innerHTML = rows.map(([k, v]) => `<div class="stat"><span>${k}</span><b>${v}</b></div>`).join('');
 }
 
 draw();

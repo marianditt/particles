@@ -31,6 +31,10 @@ interface Node {
   ub: number;
 }
 
+function gauss(): number {
+  return Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+}
+
 /**
  * Branch and bound for N unit-radius particles maximising the minimum pairwise distance min_{i<j} d_ij
  * subject to: for every sampled direction, adjacent projected centres are at most 2 apart.
@@ -61,6 +65,9 @@ export class Solver {
   private cConv = 0;
   private improvements = 0;
   private current: Node | null = null;
+  private saPos: Float64Array | null = null;
+  private saObj = -Infinity;
+  private saIter = 0;
 
   constructor(n: number, resolutionDeg: number) {
     this.n = n;
@@ -243,6 +250,110 @@ export class Solver {
     this.improvements++;
   }
 
+  /** Simulated annealing over feasible configurations; moves are rescaled onto the feasibility boundary. */
+  private localSearch(iters: number) {
+    const n = this.n;
+    if (n < 3) return;
+    const CYCLE = 4000;
+    for (let it = 0; it < iters; it++) {
+      if (!this.saPos || this.saIter >= CYCLE) {
+        this.saPos = this.bestPos.slice();
+        this.saObj = this.best;
+        this.saIter = 0;
+      }
+      const frac = this.saIter++ / CYCLE;
+      const temp = 0.02 * Math.pow(1e-3, frac) * Math.max(this.best, 1e-3);
+      const step = 0.3 * Math.pow(0.03, frac);
+      const cand = this.saPos.slice();
+      const moves = 1 + Math.floor(Math.random() * 2);
+      for (let m = 0; m < moves; m++) {
+        const i = 1 + Math.floor(Math.random() * (n - 1));
+        cand[2 * i] += gauss() * step;
+        if (i > 1) cand[2 * i + 1] += gauss() * step;
+      }
+      cand[3] = 0;
+      cand[2] = Math.abs(cand[2]);
+      cand[5] = Math.abs(cand[5]);
+      const g = this.maxGap(cand);
+      if (!(g > 0)) continue;
+      const t = 2 / g;
+      for (let k = 0; k < cand.length; k++) cand[k] *= t;
+      const obj = this.pointObjective(cand);
+      if (obj >= this.saObj || Math.random() < Math.exp((obj - this.saObj) / temp)) {
+        this.saPos = cand;
+        this.saObj = obj;
+        if (obj > this.best + 1e-12 && this.maxGap(cand) <= 2 + FEAS_TOL) {
+          this.best = obj;
+          this.bestPos = cand;
+          this.improvements++;
+        }
+      }
+    }
+  }
+
+  /**
+   * Interval constraint propagation for "all pairwise distances >= d" (needs unpackBox).
+   * Shrinks the boxes in place; returns false if the box provably has no such configuration.
+   */
+  private contract(d: number): boolean {
+    const { xlo, xhi, ylo, yhi, n } = this;
+    for (let pass = 0; pass < 3; pass++) {
+      let changed = false;
+      for (let i = 0; i < n; i++)
+        for (let j = i + 1; j < n; j++) {
+          for (let axis = 0; axis < 2; axis++) {
+            const [alo, ahi, blo, bhi] = axis === 0 ? [xlo, xhi, ylo, yhi] : [ylo, yhi, xlo, xhi];
+            const maxOther = Math.max(Math.abs(blo[i] - bhi[j]), Math.abs(bhi[i] - blo[j]));
+            if (maxOther >= d) continue;
+            const a = Math.sqrt(d * d - maxOther * maxOther);
+            let l = alo[i] - ahi[j];
+            let h = ahi[i] - alo[j];
+            if (l > -a && l < a) l = a;
+            else if (h < a && h > -a) h = -a;
+            else continue;
+            if (l > h) return false;
+            const nilo = Math.max(alo[i], alo[j] + l);
+            const nihi = Math.min(ahi[i], ahi[j] + h);
+            const njlo = Math.max(alo[j], alo[i] - h);
+            const njhi = Math.min(ahi[j], ahi[i] - l);
+            if (nilo > nihi || njlo > njhi) return false;
+            if (nilo > alo[i] || nihi < ahi[i] || njlo > alo[j] || njhi < ahi[j]) changed = true;
+            alo[i] = nilo;
+            ahi[i] = nihi;
+            alo[j] = njlo;
+            ahi[j] = njhi;
+          }
+        }
+      if (!changed) break;
+    }
+    return true;
+  }
+
+  private boxVolume(node: Node): number {
+    let v = 1;
+    for (let d = 0; d < this.dims; d++) v *= node.hi[d] - node.lo[d];
+    return v;
+  }
+
+  /** Copy the (contracted) unpacked boxes back into the node; arrays are cloned as siblings share them. */
+  private repack(node: Node): boolean {
+    const { xlo, xhi, ylo, yhi, n } = this;
+    const lo = new Float64Array(this.dims);
+    const hi = new Float64Array(this.dims);
+    lo[0] = Math.max(node.lo[0], xlo[1]);
+    hi[0] = Math.min(node.hi[0], xhi[1]);
+    for (let i = 2; i < n; i++) {
+      const k = 1 + 2 * (i - 2);
+      lo[k] = xlo[i];
+      hi[k] = xhi[i];
+      lo[k + 1] = ylo[i];
+      hi[k + 1] = yhi[i];
+    }
+    node.lo = lo;
+    node.hi = hi;
+    return true;
+  }
+
   get finished(): boolean {
     return this.stack.length === 0 && this.current === null;
   }
@@ -250,6 +361,7 @@ export class Solver {
   /** Process up to maxNodes nodes. */
   step(maxNodes: number): void {
     if (this.start === 0) this.start = performance.now();
+    this.localSearch(50);
     for (let it = 0; it < maxNodes && this.stack.length > 0; it++) {
       const node = this.stack.pop()!;
       this.nodes++;
@@ -264,6 +376,19 @@ export class Solver {
         this.pFeas += node.vol;
         this.cFeas++;
         continue;
+      }
+      // Contract the box against "min distance > best"; the removed volume counts as pruned by objective.
+      const before = this.boxVolume(node);
+      if (!this.contract(this.best + PRUNE_TOL)) {
+        this.pObj += node.vol;
+        this.cObj++;
+        continue;
+      }
+      if (this.repack(node)) {
+        const after = this.boxVolume(node);
+        const kept = before > 0 ? Math.min(1, after / before) : 1;
+        this.pObj += node.vol * (1 - kept);
+        node.vol *= kept;
       }
       this.tryMidpoint(node.lo, node.hi);
       let widest = 0;
