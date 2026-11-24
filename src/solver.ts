@@ -1,457 +1,642 @@
-export const EPS = 1e-9;
-const FEAS_TOL = 1e-9;
-const PRUNE_TOL = 1e-4;
-const MIN_WIDTH = 1e-4;
+import loadHighs from 'highs';
+import { evaluateArrangement, type Evaluation } from './evaluator';
+import { Rectangle, type Point } from './geometry';
 
-export interface Stats {
-  status: 'running' | 'done' | 'timeout';
-  n: number;
-  best: number;
-  positions: Float64Array; // x0,y0,x1,y1,...
-  globalUpper: number;
-  gap: number;
-  nodes: number;
-  elapsedMs: number;
-  exploredFraction: number;
-  prunedObjective: number; // volume fractions
-  prunedFeasibility: number;
-  converged: number;
-  prunedObjectiveCount: number;
-  prunedFeasibilityCount: number;
-  convergedCount: number;
-  improvements: number;
-  betterLikelihood: number;
-  stackSize: number;
+export interface SolverConfig {
+  width: number;
+  height: number;
+  particleCount: number;
+  seed: number;
+  tolerance: number;
+  maxRuntimeMs: number;
+  populationSize: number;
+  generations: number;
+  restarts: number;
+  lpDirectionCount: number;
+  globalOptimization: boolean;
+  maxNodes: number;
+  maxOpenNodes: number;
 }
 
-interface Node {
+export type SolverStatus =
+  | 'running'
+  | 'certified'
+  | 'best-known'
+  | 'resource-limit'
+  | 'cancelled'
+  | 'numerical-failure';
+
+export interface SolverProgress {
+  status: SolverStatus;
+  phase: string;
+  certification: string;
+  bestRadius: number;
+  upperBound: number;
+  lowerBound: number;
+  absoluteGap: number;
+  relativeGap: number;
+  centers: Point[];
+  evaluation: Evaluation;
+  exploredNodes: number;
+  prunedNodes: number;
+  remainingNodes: number;
+  heuristicEvaluations: number;
+  elapsedMs: number;
+  seed: number;
+}
+
+type ProgressCallback = (progress: SolverProgress) => void;
+type CancelCheck = () => boolean;
+
+interface SearchNode {
   lo: Float64Array;
   hi: Float64Array;
-  vol: number;
-  ub: number;
+  lowerBound: number;
   depth: number;
 }
 
-function gauss(): number {
-  return Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+interface HighsRunner {
+  solve(problem: string, options?: {
+    output_flag?: boolean;
+    primal_feasibility_tolerance?: number;
+    dual_feasibility_tolerance?: number;
+  }): {
+    Status: string;
+    ObjectiveValue: number;
+    Rows: { Name: string; Dual: number }[];
+    Columns: Record<string, { Dual: number }>;
+  };
 }
 
-/**
- * Branch and bound for N unit-radius particles maximising the area of the convex hull of their centres
- * subject to: for every sampled direction, adjacent projected centres are at most 2 apart.
- * Symmetry breaking: p0 = (0,0), p1 = (x,0) with x>0, p2 has y>=0.
- * Variables: x1, then (x_i, y_i) for i>=2.
- */
-export class Solver {
-  readonly n: number;
-  private readonly dims: number;
-  private readonly dirs: Float64Array; // cos, sin pairs
-  private readonly levels: number; // depth at which all directions are in use
-  private readonly cx: Float64Array;
-  private readonly cy: Float64Array;
-  private readonly order: Int32Array;
-  private readonly hullIdx: Int32Array;
-  private hullCount = 0;
-  private readonly stack: Node[] = [];
-  private readonly xlo: Float64Array;
-  private readonly xhi: Float64Array;
-  private readonly ylo: Float64Array;
-  private readonly yhi: Float64Array;
-  private readonly idx: number[];
-  private readonly ilo: Float64Array;
-  private readonly ihi: Float64Array;
-  private best = -Infinity;
-  private bestPos: Float64Array;
-  private nodes = 0;
-  private start = 0;
-  private pObj = 0;
-  private pFeas = 0;
-  private pConv = 0;
-  private cObj = 0;
-  private cFeas = 0;
-  private cConv = 0;
-  private improvements = 0;
-  private current: Node | null = null;
+const FLOAT_MARGIN = 1e-9;
+const yieldToWorker = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-  constructor(n: number, resolutionDeg: number) {
-    this.n = n;
-    this.dims = n >= 2 ? 2 * n - 3 : 0;
-    const count = Math.max(1, Math.ceil(180 / resolutionDeg - 1e-9));
-    this.dirs = new Float64Array(2 * count);
-    for (let k = 0; k < count; k++) {
-      const phi = (k * resolutionDeg * Math.PI) / 180;
-      this.dirs[2 * k] = Math.cos(phi);
-      this.dirs[2 * k + 1] = Math.sin(phi);
-    }
-    this.levels = Math.max(0, Math.ceil(Math.log2(count) - 1e-9));
-    this.xlo = new Float64Array(n);
-    this.xhi = new Float64Array(n);
-    this.ylo = new Float64Array(n);
-    this.yhi = new Float64Array(n);
-    this.idx = Array.from({ length: n }, (_, i) => i);
-    this.ilo = new Float64Array(n);
-    this.ihi = new Float64Array(n);
-    this.bestPos = new Float64Array(2 * n);
-    this.cx = new Float64Array(4 * n);
-    this.cy = new Float64Array(4 * n);
-    this.order = new Int32Array(4 * n);
-    this.hullIdx = new Int32Array(8 * n + 2);
+function randomGenerator(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
-    if (n >= 2) {
-      const r = 2 * (n - 1);
-      const lo = new Float64Array(this.dims);
-      const hi = new Float64Array(this.dims);
-      lo[0] = 0;
-      hi[0] = r;
-      for (let i = 2; i < n; i++) {
-        lo[1 + 2 * (i - 2)] = -r;
-        hi[1 + 2 * (i - 2)] = r;
-        lo[2 + 2 * (i - 2)] = i === 2 ? 0 : -r;
-        hi[2 + 2 * (i - 2)] = r;
-      }
-      this.stack.push({ lo, hi, vol: 1, ub: Infinity, depth: 0 });
-      // Incumbent: particles on a line with spacing 2 is always feasible (hull area 0).
-      const line = new Float64Array(2 * n);
-      for (let i = 0; i < n; i++) line[2 * i] = 2 * i;
-      this.best = this.pointObjective(line);
-      this.bestPos = line;
-      this.seed(2000);
-    } else {
-      this.best = 0;
-    }
+function canonicalize(individual: Float64Array): Float64Array {
+  const centers: Point[] = [];
+  for (let i = 0; i < individual.length; i += 2) {
+    centers.push({ x: individual[i], y: individual[i + 1] });
   }
+  centers.sort((a, b) => a.x - b.x || a.y - b.y);
+  return Float64Array.from(centers.flatMap((point) => [point.x, point.y]));
+}
 
-  private unpackBox(lo: Float64Array, hi: Float64Array) {
-    const { xlo, xhi, ylo, yhi, n } = this;
-    xlo[0] = xhi[0] = ylo[0] = yhi[0] = 0;
-    xlo[1] = lo[0];
-    xhi[1] = hi[0];
-    ylo[1] = yhi[1] = 0;
-    for (let i = 2; i < n; i++) {
-      const k = 1 + 2 * (i - 2);
-      xlo[i] = lo[k];
-      xhi[i] = hi[k];
-      ylo[i] = lo[k + 1];
-      yhi[i] = hi[k + 1];
-    }
+function asPoints(individual: ArrayLike<number>): Point[] {
+  const points: Point[] = [];
+  for (let i = 0; i < individual.length; i += 2) {
+    points.push({ x: individual[i], y: individual[i + 1] });
   }
+  return points;
+}
 
-  /**
-   * Area of the convex hull of m points (px, py); fills hullOwner with the point indices on the hull.
-   * Monotone chain; px/py are read through `order`, which is sorted in place.
-   */
-  private hullArea(px: Float64Array, py: Float64Array, m: number): number {
-    const order = this.order;
-    const h = this.hullIdx;
-    const o = order.subarray(0, m);
-    for (let k = 0; k < m; k++) o[k] = k;
-    o.sort((a, b) => px[a] - px[b] || py[a] - py[b]);
-    const cross = (a: number, b: number, c: number) =>
-      (px[b] - px[a]) * (py[c] - py[a]) - (py[b] - py[a]) * (px[c] - px[a]);
-    let k = 0;
-    for (let t = 0; t < m; t++) {
-      while (k >= 2 && cross(h[k - 2], h[k - 1], o[t]) <= 0) k--;
-      h[k++] = o[t];
-    }
-    for (let t = m - 2, lower = k + 1; t >= 0; t--) {
-      while (k >= lower && cross(h[k - 2], h[k - 1], o[t]) <= 0) k--;
-      h[k++] = o[t];
-    }
-    this.hullCount = Math.max(0, k - 1);
-    let area = 0;
-    for (let t = 0; t < this.hullCount; t++) {
-      const a = h[t];
-      const b = h[(t + 1) % this.hullCount];
-      area += px[a] * py[b] - px[b] * py[a];
-    }
-    return Math.abs(area) / 2;
-  }
+function objective(width: number, height: number, position: ArrayLike<number>): Evaluation {
+  return evaluateArrangement(width, height, asPoints(position));
+}
 
-  private pointObjective(pos: Float64Array): number {
-    const n = this.n;
-    const px = this.cx;
-    const py = this.cy;
-    for (let i = 0; i < n; i++) {
-      px[i] = pos[2 * i];
-      py[i] = pos[2 * i + 1];
-    }
-    return this.hullArea(px, py, n);
-  }
+function numericSlack(value: number): number {
+  return FLOAT_MARGIN * Math.max(1, Math.abs(value));
+}
 
-  /** Upper bound of the hull area: hull of all box corners (needs unpackBox). Records the hull's boxes. */
-  private upperBound(): number {
-    const { xlo, xhi, ylo, yhi, n, cx, cy } = this;
-    for (let i = 0; i < n; i++)
-      for (let c = 0; c < 4; c++) {
-        cx[4 * i + c] = c & 1 ? xhi[i] : xlo[i];
-        cy[4 * i + c] = c & 2 ? yhi[i] : ylo[i];
-      }
-    return this.hullArea(cx, cy, 4 * n);
-  }
-
-  /** False if the boxes (needs unpackBox) provably contain no feasible configuration. */
-  private mayBeFeasible(depth = Infinity): boolean {
-    const { xlo, xhi, ylo, yhi, n, idx, ilo, ihi, dirs } = this;
-    // Coarse direction subsets (stride 2^k) high in the tree; all directions from depth `levels` on.
-    const stride = 1 << Math.max(0, this.levels - depth);
-    for (let d = 0; d < dirs.length; d += 2 * stride) {
-      const c = dirs[d];
-      const s = dirs[d + 1];
-      const ac = Math.abs(c);
-      const as = Math.abs(s);
-      for (let i = 0; i < n; i++) {
-        const mid = c * (xlo[i] + xhi[i]) * 0.5 + s * (ylo[i] + yhi[i]) * 0.5;
-        const rad = ac * (xhi[i] - xlo[i]) * 0.5 + as * (yhi[i] - ylo[i]) * 0.5;
-        ilo[i] = mid - rad;
-        ihi[i] = mid + rad;
-      }
-      idx.sort((a, b) => ilo[a] - ilo[b]);
-      let reach = ihi[idx[0]];
-      for (let k = 1; k < n; k++) {
-        const i = idx[k];
-        if (ilo[i] - reach > 2 + FEAS_TOL) return false;
-        if (ihi[i] > reach) reach = ihi[i];
-      }
-    }
-    return true;
-  }
-
-  /** Random multi-start incumbents, rescaled onto the feasibility boundary. */
-  private seed(samples: number) {
-    const n = this.n;
-    const r = 2 * (n - 1);
-    const initialBest = this.best;
-    const pos = new Float64Array(2 * n);
-    for (let k = 0; k < samples; k++) {
-      const span = Math.random() * r;
-      for (let i = 1; i < n; i++) {
-        pos[2 * i] = (Math.random() * 2 - 1) * span;
-        pos[2 * i + 1] = (Math.random() * 2 - 1) * span;
-      }
-      pos[3] = 0;
-      pos[2] = Math.abs(pos[2]);
-      pos[5] = Math.abs(pos[5]);
-      const g = this.maxGap(pos);
-      if (!(g > 0)) continue;
-      const cand = pos.map((v) => (v * 2) / g);
-      const obj = this.pointObjective(cand);
-      if (obj > this.best && this.maxGap(cand) <= 2 + FEAS_TOL) {
-        this.best = obj;
-        this.bestPos = cand;
-      }
-    }
-    if (this.best > initialBest) this.localSearch();
-  }
-
-  /** Largest gap between adjacent projections over all sampled directions. */
-  private maxGap(pos: Float64Array): number {
-    const { n, dirs, ilo } = this;
-    let g = 0;
-    for (let d = 0; d < dirs.length; d += 2) {
-      for (let i = 0; i < n; i++) ilo[i] = dirs[d] * pos[2 * i] + dirs[d + 1] * pos[2 * i + 1];
-      const sorted = Array.from(ilo).sort((a, b) => a - b);
-      for (let i = 1; i < n; i++) g = Math.max(g, sorted[i] - sorted[i - 1]);
-    }
-    return g;
-  }
-
-  /** Evaluate the box midpoint as a candidate solution. */
-  private tryMidpoint(lo: Float64Array, hi: Float64Array) {
-    const n = this.n;
-    const pos = new Float64Array(2 * n);
-    pos[2] = (lo[0] + hi[0]) / 2;
-    for (let i = 2; i < n; i++) {
-      const k = 1 + 2 * (i - 2);
-      pos[2 * i] = (lo[k] + hi[k]) / 2;
-      pos[2 * i + 1] = (lo[k + 1] + hi[k + 1]) / 2;
-    }
-    // Projected gaps scale linearly, so rescale the point to the feasibility boundary.
-    const g = this.maxGap(pos);
-    if (!(g > 0)) return;
-    const t = 2 / g;
-    for (let k = 0; k < pos.length; k++) pos[k] *= t;
-    const obj = this.pointObjective(pos);
-    if (obj <= this.best + 1e-12) return;
-    for (let i = 0; i < n; i++) {
-      this.xlo[i] = this.xhi[i] = pos[2 * i];
-      this.ylo[i] = this.yhi[i] = pos[2 * i + 1];
-    }
-    if (!this.mayBeFeasible()) return;
-    this.best = obj;
-    this.bestPos = pos;
-    this.improvements++;
-    this.localSearch();
-  }
-
-  /**
-   * Simulated annealing with a soft feasibility push. Early on, moves are large and only partially rescaled
-   * towards the feasibility boundary (exponent w < 1) and violations are barely penalised; w and the penalty
-   * grow during the cycle and the last STRICT fraction is fully rescaled, so the walker settles on a valid cloud.
-   */
-  private localSearch(iters = 50) {
-    const n = this.n;
-    if (n < 3) return;
-    const CYCLE = iters;
-    const STRICT = 0.9;
-    let saPos = this.bestPos.slice();
-    let saObj = this.best;
-    for (let it = 0; it < iters; it++) {
-      const frac = it / CYCLE;
-      const temp = 0.02 * Math.pow(1e-3, frac) * Math.max(this.best, 1e-3);
-      const step = 0.3 * Math.pow(0.03, frac);
-      const strictness = Math.min(1, frac / STRICT);
-      const w = strictness * strictness;
-      const mu = 5 * w;
-      const cand = saPos.slice();
-      const moves = 1 + Math.floor(Math.random() * 2);
-      for (let m = 0; m < moves; m++) {
-        const i = 1 + Math.floor(Math.random() * (n - 1));
-        cand[2 * i] += gauss() * step;
-        if (i > 1) cand[2 * i + 1] += gauss() * step;
-      }
-      cand[3] = 0;
-      cand[2] = Math.abs(cand[2]);
-      cand[5] = Math.abs(cand[5]);
-      let g = this.maxGap(cand);
-      if (!(g > 0)) continue;
-      const t = Math.pow(2 / g, w);
-      for (let k = 0; k < cand.length; k++) cand[k] *= t;
-      g *= t;
-      const obj = this.pointObjective(cand);
-      const score = obj - mu * (this.best + 1) * Math.max(0, g - 2);
-      if (score >= saObj || Math.random() < Math.exp((score - saObj) / temp)) {
-        saPos = cand;
-        saObj = score;
-        if (obj > this.best + 1e-12 && g <= 2 + FEAS_TOL) {
-          this.best = obj;
-          this.bestPos = cand;
-          this.improvements++;
-        }
+export function makeDirections(count: number): number[] {
+  const directions = [0, Math.PI / 4, Math.PI / 2, (3 * Math.PI) / 4];
+  for (let denominator = Math.max(1, count - directions.length); directions.length < count; denominator++) {
+    for (let i = 0; i < denominator && directions.length < count; i++) {
+      const theta = ((i + 0.5) * Math.PI) / denominator;
+      if (!directions.some((angle) => Math.abs(angle - theta) <= 16 * Number.EPSILON)) {
+        directions.push(theta);
       }
     }
   }
+  return directions.sort((a, b) => a - b);
+}
 
-  /**
-   * Branching variable: the widest coordinate among the boxes that contribute corners to the bound hull
-   * (needs unpackBox and upperBound); only these boxes can change the bound.
-   */
-  private branchDim(node: Node, fallback: number): number {
-    const dimOf = (p: number, axis: number) => (p === 0 || (p === 1 && axis === 1) ? -1 : p === 1 ? 0 : 1 + 2 * (p - 2) + axis);
-    let bestD = -1;
-    let bestW = MIN_WIDTH;
-    for (let t = 0; t < this.hullCount; t++) {
-      const p = this.hullIdx[t] >> 2;
-      for (let axis = 0; axis < 2; axis++) {
-        const d = dimOf(p, axis);
-        if (d < 0) continue;
-        const dw = node.hi[d] - node.lo[d];
-        if (dw > bestW) {
-          bestW = dw;
-          bestD = d;
-        }
-      }
-    }
-    return bestD >= 0 ? bestD : fallback;
-  }
+function variableName(prefix: string, particle: number, rank: number): string {
+  return `${prefix}_${particle}_${rank}`;
+}
 
-  get finished(): boolean {
-    return this.stack.length === 0 && this.current === null;
-  }
+interface LinearRow {
+  name: string;
+  coefficients: Array<[number, string]>;
+  lower: number;
+  upper: number;
+}
 
-  /** Process up to maxNodes nodes. */
-  step(maxNodes: number): void {
-    if (this.start === 0) this.start = performance.now();
-    for (let it = 0; it < maxNodes && this.stack.length > 0; it++) {
-      const node = this.stack.pop()!;
-      this.nodes++;
-      this.unpackBox(node.lo, node.hi);
-      const ub = this.upperBound();
-      if (ub <= this.best + PRUNE_TOL) {
-        this.pObj += node.vol;
-        this.cObj++;
-        continue;
-      }
-      if (!this.mayBeFeasible(node.depth)) {
-        this.pFeas += node.vol;
-        this.cFeas++;
-        continue;
-      }
-      this.tryMidpoint(node.lo, node.hi);
-      let widest = 0;
-      let w = -1;
-      for (let d = 0; d < this.dims; d++) {
-        const dw = node.hi[d] - node.lo[d];
-        if (dw > w) {
-          w = dw;
-          widest = d;
-        }
-      }
-      if (w < MIN_WIDTH) {
-        this.pConv += node.vol;
-        this.cConv++;
-        continue;
-      }
-      this.unpackBox(node.lo, node.hi);
-      this.upperBound();
-      widest = this.branchDim(node, widest);
-      const mid = (node.lo[widest] + node.hi[widest]) / 2;
-      const a: Node = { lo: node.lo, hi: node.hi.slice(), vol: node.vol / 2, ub, depth: node.depth + 1 };
-      a.hi[widest] = mid;
-      const b: Node = { lo: node.lo.slice(), hi: node.hi, vol: node.vol / 2, ub, depth: node.depth + 1 };
-      b.lo[widest] = mid;
-      // Explore the half containing the better midpoint-ish region first: use ub of each half.
-      this.unpackBox(a.lo, a.hi);
-      a.ub = this.upperBound();
-      this.unpackBox(b.lo, b.hi);
-      b.ub = this.upperBound();
-      if (a.ub >= b.ub) this.stack.push(b, a);
-      else this.stack.push(a, b);
+interface LinearVariable {
+  name: string;
+  lower: number;
+  upper: number;
+  cost: number;
+}
+
+function lpExpression(terms: Array<[number, string]>): string {
+  return terms
+    .map(([coefficient, variable], index) => {
+      const sign = coefficient < 0 ? '-' : '+';
+      const abs = Math.abs(coefficient);
+      const magnitude = abs === 1 ? '' : `${abs} `;
+      return `${index === 0 ? (coefficient < 0 ? '-' : '') : ` ${sign} `}${magnitude}${variable}`;
+    })
+    .join('');
+}
+
+function directionRelaxation(
+  highs: HighsRunner,
+  direction: number,
+  support: number,
+  intervals: readonly (readonly [number, number])[],
+): number {
+  const n = intervals.length;
+  const rows: LinearRow[] = [];
+  const variables: LinearVariable[] = [{ name: 'radius', lower: 0, upper: Infinity, cost: 1 }];
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < n; k++) {
+      variables.push({ name: variableName('a', i, k), lower: 0, upper: 1, cost: 0 });
+      const [lower, upper] = intervals[i];
+      variables.push({
+        name: variableName('v', i, k),
+        lower: Math.min(0, lower),
+        upper: Math.max(0, upper),
+        cost: 0,
+      });
     }
   }
-
-  stats(status: Stats['status'] = 'running'): Stats {
-    const explored = Math.min(1, this.pObj + this.pFeas + this.pConv);
-    let globalUpper = this.best;
-    let likelihood = 0;
-    const scale = Math.abs(this.best) * 0.05 + 1e-6;
-    for (const nd of this.stack) {
-      if (nd.ub > globalUpper) globalUpper = nd.ub;
-      likelihood += nd.vol * Math.min(1, Math.max(0, nd.ub - this.best) / scale);
+  const addRow = (
+    name: string,
+    coefficients: Array<[number, string]>,
+    lower: number,
+    upper: number,
+  ) => rows.push({ name, coefficients, lower, upper });
+  for (let i = 0; i < n; i++) {
+    addRow(
+      `assign_${i}`,
+      Array.from({ length: n }, (_, k) => [1, variableName('a', i, k)]),
+      1,
+      1,
+    );
+  }
+  for (let k = 0; k < n; k++) {
+    addRow(
+      `rank_${k}`,
+      Array.from({ length: n }, (_, i) => [1, variableName('a', i, k)]),
+      1,
+      1,
+    );
+  }
+  for (let i = 0; i < n; i++) {
+    const [lower, upper] = intervals[i];
+    for (let k = 0; k < n; k++) {
+      const assignment = variableName('a', i, k);
+      const projection = variableName('v', i, k);
+      addRow(`proj_lo_${i}_${k}`, [[-lower, assignment], [1, projection]], 0, Infinity);
+      addRow(`proj_hi_${i}_${k}`, [[1, projection], [-upper, assignment]], -Infinity, 0);
     }
-    const done = this.stack.length === 0;
-    return {
-      status: done ? 'done' : status,
-      n: this.n,
-      best: this.best,
-      positions: this.bestPos,
-      globalUpper,
-      gap: globalUpper - this.best,
-      nodes: this.nodes,
-      elapsedMs: this.start ? performance.now() - this.start : 0,
-      exploredFraction: done ? 1 : explored,
-      prunedObjective: this.pObj,
-      prunedFeasibility: this.pFeas,
-      converged: this.pConv,
-      prunedObjectiveCount: this.cObj,
-      prunedFeasibilityCount: this.cFeas,
-      convergedCount: this.cConv,
-      improvements: this.improvements,
-      betterLikelihood: done ? 0 : Math.min(1, likelihood),
-      stackSize: this.stack.length,
-    };
+  }
+  addRow(
+    'left',
+    [
+      ...Array.from({ length: n }, (_, i) => [1, variableName('v', i, 0)] as [number, string]),
+      [-1, 'radius'],
+    ],
+    -Infinity,
+    -support,
+  );
+  addRow(
+    'right',
+    [
+      ...Array.from({ length: n }, (_, i) => [1, variableName('v', i, n - 1)] as [number, string]),
+      [1, 'radius'],
+    ],
+    support,
+    Infinity,
+  );
+  for (let k = 0; k + 1 < n; k++) {
+    addRow(
+      `gap_${k}`,
+      [
+        ...Array.from({ length: n }, (_, i) => [1, variableName('v', i, k + 1)] as [number, string]),
+        ...Array.from({ length: n }, (_, i) => [-1, variableName('v', i, k)] as [number, string]),
+        [-2, 'radius'],
+      ],
+      -Infinity,
+      0,
+    );
+  }
+  const constraints = rows.map((row) => {
+    const expression = lpExpression(row.coefficients);
+    if (row.lower === row.upper) return ` ${row.name}: ${expression} = ${row.lower}`;
+    if (!Number.isFinite(row.lower)) return ` ${row.name}: ${expression} <= ${row.upper}`;
+    if (!Number.isFinite(row.upper)) return ` ${row.name}: ${expression} >= ${row.lower}`;
+    return ` ${row.name}: ${row.lower} <= ${expression} <= ${row.upper}`;
+  });
+  const bounds = variables.map((variable) => {
+    if (Number.isFinite(variable.lower) && Number.isFinite(variable.upper)) {
+      return ` ${variable.lower} <= ${variable.name} <= ${variable.upper}`;
+    }
+    if (Number.isFinite(variable.lower)) return ` ${variable.name} >= ${variable.lower}`;
+    if (Number.isFinite(variable.upper)) return ` ${variable.name} <= ${variable.upper}`;
+    return ` ${variable.name} free`;
+  });
+  const lp = [
+    'Minimize',
+    ' obj: radius',
+    'Subject To',
+    ...constraints,
+    'Bounds',
+    ...bounds,
+    'End',
+  ].join('\n');
+  const result = highs.solve(lp, {
+    output_flag: false,
+    primal_feasibility_tolerance: 1e-9,
+    dual_feasibility_tolerance: 1e-9,
+  });
+  if (result.Status !== 'Optimal' || !Number.isFinite(result.ObjectiveValue)) {
+    throw new Error(`HiGHS failed for direction ${direction}: ${result.Status}`);
+  }
+  const rowDuals = new Map(result.Rows.map((row) => [row.Name, row.Dual]));
+  let dualObjective = 0;
+  let errorScale = 1;
+  for (const row of rows) {
+    const dual = rowDuals.get(row.name);
+    if (dual === undefined || !Number.isFinite(dual)) return 0;
+    const bound = dual >= 0 ? row.lower : row.upper;
+    if (!Number.isFinite(bound)) return 0;
+    const contribution = dual * bound;
+    dualObjective += contribution;
+    errorScale += Math.abs(contribution);
+  }
+  for (const variable of variables) {
+    let dualActivity = 0;
+    for (const row of rows) {
+      const dual = rowDuals.get(row.name)!;
+      const coefficient = row.coefficients.find(([, name]) => name === variable.name)?.[0] ?? 0;
+      const term = dual * coefficient;
+      dualActivity += term;
+      errorScale += Math.abs(term);
+    }
+    const reducedCost = variable.cost - dualActivity;
+    errorScale += Math.abs(variable.cost);
+    if (!Number.isFinite(reducedCost)) return 0;
+    const bound = reducedCost >= 0 ? variable.lower : variable.upper;
+    if (!Number.isFinite(bound)) return 0;
+    const contribution = reducedCost * bound;
+    dualObjective += contribution;
+    errorScale += Math.abs(contribution);
+  }
+  errorScale += Math.abs(dualObjective);
+  return Math.max(0, dualObjective - numericSlack(errorScale));
+}
+
+function boxProjectionIntervals(
+  node: SearchNode,
+  count: number,
+  theta: number,
+): [number, number][] {
+  const cosine = Math.cos(theta);
+  const sine = Math.sin(theta);
+  const intervals: [number, number][] = [];
+  for (let i = 0; i < count; i++) {
+    const x0 = node.lo[2 * i];
+    const x1 = node.hi[2 * i];
+    const y0 = node.lo[2 * i + 1];
+    const y1 = node.hi[2 * i + 1];
+    const xMin = cosine >= 0 ? x0 * cosine : x1 * cosine;
+    const xMax = cosine >= 0 ? x1 * cosine : x0 * cosine;
+    const yMin = sine >= 0 ? y0 * sine : y1 * sine;
+    const yMax = sine >= 0 ? y1 * sine : y0 * sine;
+    intervals.push([xMin + yMin, xMax + yMax]);
+  }
+  return intervals;
+}
+
+function lowerBoundForNode(
+  highs: HighsRunner,
+  node: SearchNode,
+  config: SolverConfig,
+  directionCount: number,
+): number {
+  const { width, height, particleCount } = config;
+  let lower = Math.max(width, height, Math.hypot(width, height)) / (2 * particleCount);
+  lower -= numericSlack(lower);
+  for (const theta of makeDirections(directionCount)) {
+    const rawSupport =
+      (width / 2) * Math.abs(Math.cos(theta)) + (height / 2) * Math.abs(Math.sin(theta));
+    const support = Math.max(0, rawSupport - numericSlack(rawSupport));
+    const intervals = boxProjectionIntervals(node, particleCount, theta).map(([lo, hi]) => {
+      const margin = numericSlack(Math.max(Math.abs(lo), Math.abs(hi)));
+      return [lo - margin, hi + margin] as [number, number];
+    });
+    const lowestPossibleProjection = Math.min(...intervals.map(([lo]) => lo));
+    const highestPossibleProjection = Math.max(...intervals.map(([, hi]) => hi));
+    lower = Math.max(
+      lower,
+      support + lowestPossibleProjection - numericSlack(support + lowestPossibleProjection),
+      support - highestPossibleProjection - numericSlack(support - highestPossibleProjection),
+      directionRelaxation(highs, theta, support, intervals),
+    );
+  }
+  return Math.max(0, lower);
+}
+
+function pushHeap(heap: SearchNode[], node: SearchNode): void {
+  heap.push(node);
+  let index = heap.length - 1;
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    if (heap[parent].lowerBound <= heap[index].lowerBound) break;
+    [heap[parent], heap[index]] = [heap[index], heap[parent]];
+    index = parent;
   }
 }
 
-/** Check feasibility of explicit centres (x0,y0,x1,y1,...) for a direction resolution. */
-export function isFeasible(pos: ArrayLike<number>, resolutionDeg: number): boolean {
-  const n = pos.length / 2;
-  const count = Math.max(1, Math.ceil(180 / resolutionDeg - 1e-9));
-  for (let k = 0; k < count; k++) {
-    const phi = (k * resolutionDeg * Math.PI) / 180;
-    const p: number[] = [];
-    for (let i = 0; i < n; i++) p.push(Math.cos(phi) * pos[2 * i] + Math.sin(phi) * pos[2 * i + 1]);
-    p.sort((a, b) => a - b);
-    for (let i = 1; i < n; i++) if (p[i] - p[i - 1] > 2 + FEAS_TOL) return false;
+function popHeap(heap: SearchNode[]): SearchNode | undefined {
+  if (heap.length === 0) return undefined;
+  const first = heap[0];
+  const last = heap.pop()!;
+  if (heap.length > 0) {
+    heap[0] = last;
+    let index = 0;
+    for (;;) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let smallest = index;
+      if (left < heap.length && heap[left].lowerBound < heap[smallest].lowerBound) smallest = left;
+      if (right < heap.length && heap[right].lowerBound < heap[smallest].lowerBound) smallest = right;
+      if (smallest === index) break;
+      [heap[index], heap[smallest]] = [heap[smallest], heap[index]];
+      index = smallest;
+    }
   }
-  return true;
+  return first;
+}
+
+function splitDimension(node: SearchNode, width: number, height: number): number {
+  let selected = -1;
+  let largest = 0;
+  for (let i = 0; i < node.lo.length; i++) {
+    const scale = i % 2 === 0 ? width : height;
+    const score = (node.hi[i] - node.lo[i]) / scale;
+    if (score > largest) {
+      largest = score;
+      selected = i;
+    }
+  }
+  return selected;
+}
+
+function makeProgress(
+  config: SolverConfig,
+  status: SolverStatus,
+  phase: string,
+  certification: string,
+  bestPosition: Float64Array,
+  bestEvaluation: Evaluation,
+  lowerBound: number,
+  counts: { nodes: number; pruned: number; remaining: number; evaluations: number },
+  start: number,
+): SolverProgress {
+  const upperBound = bestEvaluation.radius + numericSlack(bestEvaluation.radius);
+  const absoluteGap = Math.max(0, upperBound - lowerBound);
+  return {
+    status,
+    phase,
+    certification,
+    bestRadius: bestEvaluation.radius,
+    upperBound,
+    lowerBound,
+    absoluteGap,
+    relativeGap: absoluteGap / Math.max(upperBound, Number.MIN_VALUE),
+    centers: asPoints(bestPosition),
+    evaluation: bestEvaluation,
+    exploredNodes: counts.nodes,
+    prunedNodes: counts.pruned,
+    remainingNodes: counts.remaining,
+    heuristicEvaluations: counts.evaluations,
+    elapsedMs: performance.now() - start,
+    seed: config.seed,
+  };
+}
+
+export async function optimize(
+  config: SolverConfig,
+  onProgress: ProgressCallback,
+  isCancelled: CancelCheck,
+): Promise<SolverProgress> {
+  const started = performance.now();
+  const rng = randomGenerator(config.seed);
+  const dimensions = config.particleCount * 2;
+  const geometry = new Rectangle(config.width, config.height);
+  const low = new Float64Array(dimensions);
+  const high = new Float64Array(dimensions);
+  for (let i = 0; i < config.particleCount; i++) {
+    low[2 * i] = geometry.bounds.minX;
+    high[2 * i] = geometry.bounds.maxX;
+    low[2 * i + 1] = geometry.bounds.minY;
+    high[2 * i + 1] = geometry.bounds.maxY;
+  }
+
+  let bestPosition: Float64Array<ArrayBufferLike> = new Float64Array(dimensions);
+  let bestEvaluation = objective(config.width, config.height, bestPosition);
+  let evaluations = 1;
+  let nodes = 0;
+  let pruned = 0;
+  let remaining = 0;
+  const initialLower = Math.max(config.width, config.height, Math.hypot(config.width, config.height)) /
+    (2 * config.particleCount);
+
+  onProgress(
+    makeProgress(config, 'running', 'Heuristic initialization', 'Not yet certified', bestPosition, bestEvaluation, Math.max(0, initialLower - numericSlack(initialLower)), { nodes, pruned, remaining, evaluations }, started),
+  );
+
+  const evaluate = (candidate: Float64Array): Evaluation => {
+    evaluations++;
+    return objective(config.width, config.height, candidate);
+  };
+  const populationSize = Math.max(4, config.populationSize);
+  const dimensionBounds = (index: number) => [low[index], high[index]] as const;
+
+  for (let restart = 0; restart < config.restarts; restart++) {
+    const population: Float64Array[] = [];
+    const scores: Evaluation[] = [];
+    for (let i = 0; i < populationSize; i++) {
+      const candidate = new Float64Array(dimensions);
+      if (i !== 0 || restart !== 0) {
+        for (let d = 0; d < dimensions; d++) {
+          const [min, max] = dimensionBounds(d);
+          candidate[d] = min + rng() * (max - min);
+        }
+      }
+      const canonical = canonicalize(candidate);
+      const score = evaluate(canonical);
+      population.push(canonical);
+      scores.push(score);
+      if (score.radius < bestEvaluation.radius) {
+        bestPosition = canonical;
+        bestEvaluation = score;
+      }
+    }
+    onProgress(
+      makeProgress(config, 'running', `Differential evolution (${restart + 1}/${config.restarts})`, 'Not yet certified', bestPosition, bestEvaluation, Math.max(0, initialLower - numericSlack(initialLower)), { nodes, pruned, remaining, evaluations }, started),
+    );
+
+    for (let generation = 0; generation < config.generations; generation++) {
+      if (isCancelled()) {
+        return makeProgress(config, 'cancelled', 'Cancelled during heuristic search', 'Best-known solution; no global certificate', bestPosition, bestEvaluation, Math.max(0, initialLower - numericSlack(initialLower)), { nodes, pruned, remaining, evaluations }, started);
+      }
+      for (let target = 0; target < populationSize; target++) {
+        let a = target;
+        let b = target;
+        let c = target;
+        while (a === target) a = Math.floor(rng() * populationSize);
+        while (b === target || b === a) b = Math.floor(rng() * populationSize);
+        while (c === target || c === a || c === b) c = Math.floor(rng() * populationSize);
+        const mutant = new Float64Array(dimensions);
+        const forced = Math.floor(rng() * dimensions);
+        for (let d = 0; d < dimensions; d++) {
+          if (d === forced || rng() < 0.8) {
+            const value = population[a][d] + 0.7 * (population[b][d] - population[c][d]);
+            mutant[d] = Math.max(low[d], Math.min(high[d], value));
+          } else {
+            mutant[d] = population[target][d];
+          }
+        }
+        const candidate = canonicalize(mutant);
+        const score = evaluate(candidate);
+        if (score.radius <= scores[target].radius) {
+          population[target] = candidate;
+          scores[target] = score;
+        }
+        if (score.radius < bestEvaluation.radius) {
+          bestPosition = candidate;
+          bestEvaluation = score;
+        }
+      }
+      if (generation % 10 === 0 || generation + 1 === config.generations) {
+        onProgress(
+          makeProgress(config, 'running', `Differential evolution (${restart + 1}/${config.restarts}), generation ${generation + 1}/${config.generations}`, 'Not yet certified', bestPosition, bestEvaluation, Math.max(0, initialLower - numericSlack(initialLower)), { nodes, pruned, remaining, evaluations }, started),
+        );
+        await yieldToWorker();
+      }
+      if (performance.now() - started >= config.maxRuntimeMs) {
+        return makeProgress(config, 'resource-limit', 'Maximum runtime reached during heuristic search', 'Best-known solution; no global certificate', bestPosition, bestEvaluation, Math.max(0, initialLower - numericSlack(initialLower)), { nodes, pruned, remaining, evaluations }, started);
+      }
+    }
+  }
+
+  let lowerBound = Math.max(0, initialLower - numericSlack(initialLower));
+  if (!config.globalOptimization) {
+    return makeProgress(config, 'best-known', 'Heuristic search complete; global optimization disabled', 'Best-known solution; no global certificate', bestPosition, bestEvaluation, lowerBound, { nodes, pruned, remaining, evaluations }, started);
+  }
+
+  let highs: HighsRunner;
+  try {
+    highs = (await (typeof self === 'undefined'
+      ? loadHighs()
+      : loadHighs({
+          locateFile: (file) => new URL(`./solver-assets/${file}`, self.location.href).href,
+        }))) as HighsRunner;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to initialize the local HiGHS WebAssembly solver: ${message}`);
+  }
+
+  const root: SearchNode = { lo: low.slice(), hi: high.slice(), lowerBound: lowerBound, depth: 0 };
+  root.lowerBound = lowerBoundForNode(highs, root, config, config.lpDirectionCount);
+  const heap: SearchNode[] = [];
+  pushHeap(heap, root);
+  let closedLowerBound = Infinity;
+  let directionCount = config.lpDirectionCount;
+
+  while (heap.length > 0) {
+    if (isCancelled()) {
+      const currentLower = Math.min(closedLowerBound, heap[0]?.lowerBound ?? Infinity);
+      return makeProgress(config, 'cancelled', 'Cancelled during branch-and-bound', 'Best-known solution; no global certificate', bestPosition, bestEvaluation, Math.min(lowerBound, currentLower), { nodes, pruned, remaining: heap.length, evaluations }, started);
+    }
+    const openLower = heap[0].lowerBound;
+    lowerBound = Math.min(closedLowerBound, openLower);
+    const upperBound = bestEvaluation.radius + numericSlack(bestEvaluation.radius);
+    if (upperBound - lowerBound <= config.tolerance) {
+      return makeProgress(config, 'certified', 'Branch-and-bound gap target reached', 'Certified within requested absolute tolerance using conservative floating-point margins', bestPosition, bestEvaluation, lowerBound, { nodes, pruned, remaining: heap.length, evaluations }, started);
+    }
+    if (nodes >= config.maxNodes || performance.now() - started >= config.maxRuntimeMs) {
+      remaining = heap.length;
+      return makeProgress(config, 'resource-limit', 'Branch-and-bound resource limit reached', 'Best-known solution; global certificate not reached', bestPosition, bestEvaluation, lowerBound, { nodes, pruned, remaining, evaluations }, started);
+    }
+    const node = popHeap(heap)!;
+    nodes++;
+    if (nodes > 0 && nodes % 250 === 0 && directionCount < Math.min(36, config.lpDirectionCount * 4)) {
+      directionCount = Math.min(36, config.lpDirectionCount * 4, directionCount + config.lpDirectionCount);
+    }
+    if (node.lowerBound >= upperBound - config.tolerance) {
+      closedLowerBound = Math.min(closedLowerBound, node.lowerBound);
+      pruned++;
+      continue;
+    }
+
+    const midpoint = Float64Array.from(node.lo, (value, i) => (value + node.hi[i]) / 2);
+    const midpointCanonical = canonicalize(midpoint);
+    const midpointEvaluation = evaluate(midpointCanonical);
+    if (midpointEvaluation.radius < bestEvaluation.radius) {
+      bestPosition = midpointCanonical;
+      bestEvaluation = midpointEvaluation;
+    }
+
+    const dimension = splitDimension(node, config.width, config.height);
+    if (dimension < 0 || node.hi[dimension] === node.lo[dimension]) {
+      closedLowerBound = Math.min(closedLowerBound, node.lowerBound);
+      pruned++;
+      continue;
+    }
+    const midpointCoordinate = (node.lo[dimension] + node.hi[dimension]) / 2;
+    const leftHigh = node.hi.slice();
+    leftHigh[dimension] = midpointCoordinate;
+    const rightLow = node.lo.slice();
+    rightLow[dimension] = midpointCoordinate;
+    const children: SearchNode[] = [
+      { lo: node.lo, hi: leftHigh, lowerBound: 0, depth: node.depth + 1 },
+      { lo: rightLow, hi: node.hi, lowerBound: 0, depth: node.depth + 1 },
+    ];
+    for (const child of children) {
+      child.lowerBound = lowerBoundForNode(highs, child, config, directionCount);
+    }
+    if (heap.length + children.length > config.maxOpenNodes) {
+      pushHeap(heap, node);
+      remaining = heap.length;
+      return makeProgress(config, 'resource-limit', 'Open-node memory limit reached', 'Best-known solution; global certificate not reached', bestPosition, bestEvaluation, Math.min(closedLowerBound, heap[0]?.lowerBound ?? node.lowerBound), { nodes, pruned, remaining, evaluations }, started);
+    }
+    for (const child of children) pushHeap(heap, child);
+    if (nodes % 5 === 0) {
+      const currentLower = Math.min(closedLowerBound, heap[0]?.lowerBound ?? Infinity);
+      onProgress(
+        makeProgress(config, 'running', `Branch-and-bound (${directionCount} LP directions)`, 'Certification in progress', bestPosition, bestEvaluation, currentLower, { nodes, pruned, remaining: heap.length, evaluations }, started),
+      );
+      await yieldToWorker();
+    }
+  }
+
+  lowerBound = closedLowerBound;
+  const finalStatus = bestEvaluation.radius + numericSlack(bestEvaluation.radius) - lowerBound <= config.tolerance
+    ? 'certified'
+    : 'numerical-failure';
+  return makeProgress(
+    config,
+    finalStatus,
+    finalStatus === 'certified' ? 'Search space exhausted' : 'Search exhausted without a valid gap certificate',
+    finalStatus === 'certified' ? 'Certified within requested absolute tolerance using conservative floating-point margins' : 'Numerical failure; do not treat as globally optimal',
+    bestPosition,
+    bestEvaluation,
+    lowerBound,
+    { nodes, pruned, remaining: 0, evaluations },
+    started,
+  );
 }

@@ -1,33 +1,86 @@
 import { describe, expect, it } from 'vitest';
-import { Solver, isFeasible } from './solver';
+import { makeDirections, optimize, type SolverConfig } from './solver';
 
-function solve(n: number, res: number) {
-  const s = new Solver(n, res);
-  const t = Date.now();
-  while (!s.finished && Date.now() - t < 20000) s.step(100);
-  return s.stats();
-}
+const baseConfig: SolverConfig = {
+  width: 4,
+  height: 2,
+  particleCount: 1,
+  seed: 1,
+  tolerance: 1e-3,
+  maxRuntimeMs: 20000,
+  populationSize: 8,
+  generations: 3,
+  restarts: 1,
+  lpDirectionCount: 4,
+  globalOptimization: false,
+  maxNodes: 100,
+  maxOpenNodes: 100,
+};
 
-describe('solver', () => {
-  it('N=1 is trivially done', () => {
-    expect(solve(1, 5).status).toBe('done');
+describe('optimizer', () => {
+  it('always samples horizontal, vertical and both diagonal directions', () => {
+    for (const count of [4, 5, 8, 13]) {
+      const directions = makeDirections(count);
+      expect(directions).toHaveLength(count);
+      for (const required of [0, Math.PI / 4, Math.PI / 2, (3 * Math.PI) / 4]) {
+        expect(directions.some((angle) => Math.abs(angle - required) < 1e-12)).toBe(true);
+      }
+    }
   });
-  it('N=2 has hull area 0', () => {
-    const s = solve(2, 5);
-    expect(s.status).toBe('done');
-    expect(s.best).toBeCloseTo(0, 6);
+
+  it('is reproducible for a fixed random seed', async () => {
+    const run = async () => {
+      return optimize(baseConfig, () => {}, () => false);
+    };
+    const first = await run();
+    const second = await run();
+    expect(first.centers).toEqual(second.centers);
+    expect(first.bestRadius).toBe(second.bestRadius);
   });
-  it('N=3 is at least the line configuration and is feasible', () => {
-    const s = solve(3, 10);
-    expect(s.status).toBe('done');
-    expect(s.best).toBeGreaterThan(0);
-    expect(isFeasible(s.positions, 10)).toBe(true);
+
+  it('keeps the global lower bound below the known feasible upper bound', async () => {
+    const progress = await optimize(baseConfig, () => {}, () => false);
+    expect(progress.lowerBound).toBeLessThanOrEqual(progress.upperBound);
+    expect(progress.bestRadius).toBeCloseTo(Math.hypot(4, 2) / 2, 12);
+    expect(progress.status).toBe('best-known');
   });
-  it('reports consistent fractions', () => {
-    const s = solve(3, 10);
-    const classifiedFraction = s.prunedObjective + s.prunedFeasibility + s.converged;
-    expect(s.exploredFraction).toBeCloseTo(classifiedFraction, 6);
-    expect(s.exploredFraction).toBeGreaterThanOrEqual(0);
-    expect(s.exploredFraction).toBeLessThanOrEqual(1);
+
+  it('certifies the one-particle analytical benchmark at a loose gap', async () => {
+    const progress = await optimize(
+      { ...baseConfig, globalOptimization: true, tolerance: 0.01 },
+      () => {},
+      () => false,
+    );
+    expect(progress.status).toBe('certified');
+    expect(progress.absoluteGap).toBeLessThanOrEqual(0.01);
+  });
+
+  it('returns the best-known result when cancelled', async () => {
+    const result = await optimize(
+      { ...baseConfig, generations: 50 },
+      () => {},
+      () => true,
+    );
+    expect(result.status).toBe('cancelled');
+    expect(result.bestRadius).toBeCloseTo(Math.hypot(4, 2) / 2, 12);
+  });
+
+  it('preserves the unexplored region when the open-node limit is reached', async () => {
+    const result = await optimize(
+      {
+        ...baseConfig,
+        width: 6,
+        height: 4,
+        particleCount: 2,
+        globalOptimization: true,
+        maxNodes: 10,
+        maxOpenNodes: 1,
+      },
+      () => {},
+      () => false,
+    );
+    expect(result.status).toBe('resource-limit');
+    expect(result.remainingNodes).toBe(1);
+    expect(result.lowerBound).toBeLessThanOrEqual(result.upperBound);
   });
 });
