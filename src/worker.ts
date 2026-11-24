@@ -1,7 +1,9 @@
 import { optimize, type SolverConfig, type SolverProgress } from './solver';
+import { anneal, type AnnealingConfig } from './annealing';
 
 type WorkerRequest =
-  | { type: 'start'; config: SolverConfig }
+  | { type: 'start'; method: 'global'; config: SolverConfig }
+  | { type: 'start'; method: 'annealing'; config: AnnealingConfig }
   | { type: 'cancel' };
 
 let cancelled = false;
@@ -17,14 +19,17 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   running = true;
   cancelled = false;
   latest = null;
-  void optimize(
-    event.data.config,
-    (progress) => {
+  const callbacks = [
+    (progress: SolverProgress) => {
       latest = progress;
       self.postMessage(progress);
     },
     () => cancelled,
-  )
+  ] as const;
+  const result = event.data.method === 'annealing'
+    ? anneal(event.data.config, ...callbacks)
+    : optimize(event.data.config, ...callbacks);
+  void result
     .then((progress) => self.postMessage(progress))
     .catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);

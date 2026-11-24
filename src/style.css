@@ -56,6 +56,13 @@ main {
 .section-title.compact { margin-bottom: 14px; }
 .scope, .hint { color: var(--muted); font-size: 11px; }
 .scope { border: 1px solid var(--border); border-radius: 99px; padding: 5px 9px; }
+.solver-tabs { display: flex; gap: 6px; margin-top: 18px; border-bottom: 1px solid var(--border); }
+.solver-tabs button { border-radius: 6px 6px 0 0; background: transparent; color: var(--muted); }
+.solver-tabs button[aria-selected="true"] { background: var(--panel-raised); color: var(--accent); }
+fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+fieldset[hidden] { display: none; }
+.global-check { margin-top: 17px; }
+.solver-note { margin-top: 16px; color: var(--muted); font-size: 12px; }
 
 .fields {
   display: grid;

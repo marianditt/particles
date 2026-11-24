@@ -25,6 +25,10 @@
           </div>
           <span class="scope">1–10 particles</span>
         </div>
+        <div class="solver-tabs" role="tablist" aria-label="Optimization approach">
+          <button id="tab-global" type="button" role="tab" aria-selected="true" aria-controls="global-options">Global solver</button>
+          <button id="tab-annealing" type="button" role="tab" aria-selected="false" aria-controls="annealing-options" tabindex="-1">Simulated annealing</button>
+        </div>
         <form id="config">
           <div class="fields">
             <label>Width
@@ -39,11 +43,14 @@
             <label>Random seed
               <input id="seed" name="seed" type="number" min="0" step="1" value="1" required />
             </label>
-            <label>Target absolute gap
-              <input id="tolerance" name="tolerance" type="number" min="0.000000001" step="any" value="0.001" required />
-            </label>
             <label>Maximum runtime (seconds)
               <input id="runtime" name="runtime" type="number" min="0.001" step="any" value="60" required />
+            </label>
+          </div>
+          <fieldset id="global-options" role="tabpanel" aria-labelledby="tab-global">
+            <div class="fields">
+            <label>Target absolute gap
+              <input id="tolerance" name="tolerance" type="number" min="0.000000001" step="any" value="0.001" required />
             </label>
             <label>DE population
               <input id="population" name="population" type="number" min="4" step="1" value="60" required />
@@ -63,9 +70,24 @@
             <label>Maximum open nodes
               <input id="maxOpenNodes" name="maxOpenNodes" type="number" min="1" step="1" value="10000" required />
             </label>
-          </div>
+            </div>
+            <label class="check-label global-check"><input id="global" type="checkbox" checked /> Run global branch-and-bound</label>
+          </fieldset>
+          <fieldset id="annealing-options" role="tabpanel" aria-labelledby="tab-annealing" hidden disabled>
+            <p class="solver-note">Sampled directions guide a heuristic search; results are not globally certified.</p>
+            <div class="fields">
+              <label>Sampled directions
+                <input id="annealingDirections" type="number" min="4" max="720" step="1" value="64" required />
+              </label>
+              <label>Iterations / restart
+                <input id="annealingIterations" type="number" min="1" step="1" value="10000" required />
+              </label>
+              <label>Independent restarts
+                <input id="annealingRestarts" type="number" min="1" step="1" value="3" required />
+              </label>
+            </div>
+          </fieldset>
           <div class="controls">
-            <label class="check-label"><input id="global" type="checkbox" checked /> Run global branch-and-bound</label>
             <div class="button-row">
               <button id="start" type="submit">Start optimization</button>
               <button id="cancel" type="button" class="secondary" disabled>Cancel</button>

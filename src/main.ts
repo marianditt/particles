@@ -2,6 +2,7 @@ import './style.css';
 import { evaluateArrangement } from './evaluator';
 import { Rectangle, type Point } from './geometry';
 import type { SolverConfig, SolverProgress } from './solver';
+import type { AnnealingConfig } from './annealing';
 
 const $ = <T extends HTMLElement>(id: string) => {
   const element = document.getElementById(id);
@@ -25,10 +26,16 @@ const certificationElement = $('certification');
 const statsElement = $('stats');
 const coordinatesElement = $('coordinates');
 const criticalElement = $('critical');
+const globalTab = $<HTMLButtonElement>('tab-global');
+const annealingTab = $<HTMLButtonElement>('tab-annealing');
+const globalOptions = $<HTMLFieldSetElement>('global-options');
+const annealingOptions = $<HTMLFieldSetElement>('annealing-options');
 
 let worker: Worker | null = null;
 let lastProgress: SolverProgress | null = null;
-let lastConfig: SolverConfig | null = null;
+let lastConfig: SolverConfig | AnnealingConfig | null = null;
+let method: 'global' | 'annealing' = 'global';
+let lastMethod: 'global' | 'annealing' = 'global';
 let zoom = 1;
 let panX = 0;
 let panY = 0;
@@ -48,7 +55,7 @@ function positiveInteger(id: string, label: string, minimum: number): number {
   return value;
 }
 
-function readConfig(): SolverConfig {
+function readCommonConfig() {
   const width = numberValue('width');
   const height = numberValue('height');
   if (width <= 0 || height <= 0) throw new Error('Width and height must be positive');
@@ -56,24 +63,25 @@ function readConfig(): SolverConfig {
   if (particleCount > 10) throw new Error('Particle count must be between 1 and 10');
   const seed = positiveInteger('seed', 'Random seed', 0);
   if (seed > 0xffffffff) throw new Error('Random seed must be in [0, 4294967295]');
-  const tolerance = numberValue('tolerance');
   const maxRuntimeSeconds = numberValue('runtime');
-  if (tolerance <= 0) throw new Error('Target absolute gap must be positive');
   if (maxRuntimeSeconds <= 0 || !Number.isFinite(maxRuntimeSeconds * 1000)) {
     throw new Error('Maximum runtime must be positive and representable in milliseconds');
   }
+  return { width, height, particleCount, seed, maxRuntimeMs: maxRuntimeSeconds * 1000 };
+}
+
+function readConfig(): SolverConfig {
+  const common = readCommonConfig();
+  const tolerance = numberValue('tolerance');
+  if (tolerance <= 0) throw new Error('Target absolute gap must be positive');
   const populationSize = positiveInteger('population', 'DE population', 4);
   const generations = positiveInteger('generations', 'DE generations', 1);
   const restarts = positiveInteger('restarts', 'Independent restarts', 1);
   const lpDirectionCount = positiveInteger('directions', 'LP direction count', 4);
   if (lpDirectionCount > 180) throw new Error('LP direction count must not exceed 180');
   return {
-    width,
-    height,
-    particleCount,
-    seed,
+    ...common,
     tolerance,
-    maxRuntimeMs: maxRuntimeSeconds * 1000,
     populationSize,
     generations,
     restarts,
@@ -81,6 +89,17 @@ function readConfig(): SolverConfig {
     globalOptimization: $<HTMLInputElement>('global').checked,
     maxNodes: positiveInteger('maxNodes', 'Maximum explored nodes', 1),
     maxOpenNodes: positiveInteger('maxOpenNodes', 'Maximum open nodes', 1),
+  };
+}
+
+function readAnnealingConfig(): AnnealingConfig {
+  const directionCount = positiveInteger('annealingDirections', 'Sampled direction count', 4);
+  if (directionCount > 720) throw new Error('Sampled direction count must not exceed 720');
+  return {
+    ...readCommonConfig(),
+    directionCount,
+    iterations: positiveInteger('annealingIterations', 'Iterations per restart', 1),
+    restarts: positiveInteger('annealingRestarts', 'Independent restarts', 1),
   };
 }
 
@@ -111,7 +130,11 @@ function render(progress: SolverProgress): void {
   phaseElement.textContent = `${progress.phase} · ${progress.status}`;
   certificationElement.textContent = progress.certification;
   certificationElement.className = `certification ${progress.status}`;
-  statsElement.replaceChildren(
+  statsElement.replaceChildren(...(lastMethod === 'annealing' ? [
+    stat('Best validated radius', format(progress.bestRadius)),
+    stat('Sampled evaluations', progress.heuristicEvaluations.toLocaleString()),
+    stat('Elapsed', formatDuration(progress.elapsedMs)),
+  ] : [
     stat('Best radius', format(progress.bestRadius)),
     stat('Global upper bound', format(progress.upperBound)),
     stat('Global lower bound', format(progress.lowerBound)),
@@ -122,7 +145,7 @@ function render(progress: SolverProgress): void {
     stat('Remaining nodes', progress.remainingNodes.toLocaleString()),
     stat('Heuristic evaluations', progress.heuristicEvaluations.toLocaleString()),
     stat('Elapsed', formatDuration(progress.elapsedMs)),
-  );
+  ]));
   coordinatesElement.replaceChildren();
   const list = document.createElement('ol');
   list.className = 'coordinate-list';
@@ -150,20 +173,58 @@ function visibleStatus(progress: SolverProgress): boolean {
 function setWorkerActive(active: boolean): void {
   startButton.disabled = active;
   cancelButton.disabled = !active;
+  globalTab.disabled = active;
+  annealingTab.disabled = active;
+}
+
+function selectMethod(next: 'global' | 'annealing'): void {
+  method = next;
+  for (const [tab, panel, selected] of [
+    [globalTab, globalOptions, next === 'global'],
+    [annealingTab, annealingOptions, next === 'annealing'],
+  ] as const) {
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    panel.hidden = !selected;
+    panel.disabled = !selected;
+  }
+}
+
+globalTab.addEventListener('click', () => selectMethod('global'));
+annealingTab.addEventListener('click', () => selectMethod('annealing'));
+for (const tab of [globalTab, annealingTab]) {
+  tab.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const next = method === 'global' ? 'annealing' : 'global';
+    selectMethod(next);
+    (next === 'global' ? globalTab : annealingTab).focus();
+  });
 }
 
 form.addEventListener('submit', (event) => {
   event.preventDefault();
   errorElement.textContent = '';
-  let config: SolverConfig;
+  let config: SolverConfig | AnnealingConfig;
   try {
-    config = readConfig();
+    config = method === 'global' ? readConfig() : readAnnealingConfig();
   } catch (error) {
     errorElement.textContent = error instanceof Error ? error.message : String(error);
     return;
   }
   worker?.terminate();
   lastConfig = config;
+  lastMethod = method;
+  lastProgress = null;
+  recalculateButton.disabled = true;
+  jsonButton.disabled = true;
+  csvButton.disabled = true;
+  phaseElement.textContent = 'Starting optimization';
+  certificationElement.textContent = 'No result yet';
+  certificationElement.className = 'certification';
+  statsElement.replaceChildren();
+  coordinatesElement.textContent = 'Coordinates will appear when an arrangement is available.';
+  criticalElement.textContent = 'Start an optimization to inspect its best-known arrangement.';
   zoom = 1;
   panX = 0;
   panY = 0;
@@ -190,7 +251,7 @@ form.addEventListener('submit', (event) => {
     worker = null;
   };
   setWorkerActive(true);
-  worker.postMessage({ type: 'start', config });
+  worker.postMessage({ type: 'start', method, config });
 });
 
 cancelButton.addEventListener('click', () => worker?.postMessage({ type: 'cancel' }));
@@ -241,7 +302,9 @@ recalculateButton.addEventListener('click', () => {
       ...previous,
       status: 'best-known',
       phase: 'Current arrangement recalculated',
-      certification: 'Validated feasible arrangement; recalculation does not certify global optimality',
+      certification: lastMethod === 'annealing'
+        ? 'Heuristic solution validated over all directions; global optimality is not certified'
+        : 'Validated feasible arrangement; recalculation does not certify global optimality',
       bestRadius: evaluation.radius,
       upperBound,
       lowerBound,
@@ -269,14 +332,17 @@ jsonButton.addEventListener('click', () => {
     'particle-blocking-result.json',
     JSON.stringify(
       {
+        method: lastMethod,
         configuration: lastConfig,
         status: lastProgress.status,
         certification: lastProgress.certification,
         bestRadius: lastProgress.bestRadius,
-        lowerBound: lastProgress.lowerBound,
-        upperBound: lastProgress.upperBound,
-        absoluteGap: lastProgress.absoluteGap,
-        relativeGap: lastProgress.relativeGap,
+        ...(lastMethod === 'global' ? {
+          lowerBound: lastProgress.lowerBound,
+          upperBound: lastProgress.upperBound,
+          absoluteGap: lastProgress.absoluteGap,
+          relativeGap: lastProgress.relativeGap,
+        } : {}),
         centers: lastProgress.centers,
         criticalAngleRadians: lastProgress.evaluation.criticalAngle,
         activeConstraint: lastProgress.evaluation.activeConstraint,
