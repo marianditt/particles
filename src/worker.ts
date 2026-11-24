@@ -1,32 +1,45 @@
-import { Solver } from './solver';
+import { optimize, type SolverConfig, type SolverProgress } from './solver';
 
-export interface StartMessage {
-  n: number;
-  resolution: number;
-  timeLimitMs: number;
-}
+type WorkerRequest =
+  | { type: 'start'; config: SolverConfig }
+  | { type: 'cancel' };
 
-self.onmessage = (e: MessageEvent<StartMessage>) => {
-  const { n, resolution, timeLimitMs } = e.data;
-  const solver = new Solver(n, resolution);
-  const t0 = performance.now();
-  let lastPost = 0;
-  const post = (s: ReturnType<Solver['stats']>) => (self as unknown as Worker).postMessage(s);
-  post(solver.stats());
-  for (;;) {
-    solver.step(50);
-    const now = performance.now();
-    if (solver.finished) {
-      post(solver.stats('done'));
-      return;
-    }
-    if (now - t0 > timeLimitMs) {
-      post(solver.stats('timeout'));
-      return;
-    }
-    if (now - lastPost > 250) {
-      lastPost = now;
-      post(solver.stats());
-    }
+let cancelled = false;
+let running = false;
+let latest: SolverProgress | null = null;
+
+self.onmessage = (event: MessageEvent<WorkerRequest>) => {
+  if (event.data.type === 'cancel') {
+    cancelled = true;
+    return;
   }
+  if (running) return;
+  running = true;
+  cancelled = false;
+  latest = null;
+  void optimize(
+    event.data.config,
+    (progress) => {
+      latest = progress;
+      self.postMessage(progress);
+    },
+    () => cancelled,
+  )
+    .then((progress) => self.postMessage(progress))
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (latest) {
+        self.postMessage({
+          ...latest,
+          status: 'numerical-failure',
+          phase: message,
+          certification: 'Numerical failure; do not treat as globally optimal',
+        } satisfies SolverProgress);
+      } else {
+        self.postMessage({ type: 'error', message });
+      }
+    })
+    .finally(() => {
+      running = false;
+    });
 };
